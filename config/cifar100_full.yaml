@@ -1,0 +1,61 @@
+# cifar100_full.yaml — full-fidelity cloud run.
+# Full CIFAR-100, deep HOPE stack, full-fidelity Self-Modifying Titans memory
+# (learned internal optimizer + surprise-modulated L2 self-update + full BPTT)
+# and a deep multi-frequency Continuum Memory System. Long pretrain.
+# Intended for multi-GPU / cloud hardware.
+
+run_name: cifar100_full
+
+data:
+  dataset: cifar100
+  root: ./data
+  subset_train: null
+  subset_val: null
+  num_workers: 8
+
+model:
+  img_size: 32
+  patch_size: 4
+  d_model: 384
+  num_layers: 6
+  num_heads: 6
+  dropout: 0.1
+
+  titans:
+    num_persistent_memory: 16
+    d_hidden: 512
+    init_memory_std: 0.02
+
+  cms:
+    num_modules: 4
+    base_update_freq: 1
+    d_ff_multiplier: 4
+
+  jepa:
+    predictor_depth: 4
+    mask_ratio: 0.65
+
+sigreg:
+  enabled: true
+  sketch_dim: 128
+  target_scale: 1.0
+  weight: 1.0
+
+ssl:
+  epochs: 400
+  batch_size: 512
+  lr: 5.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 10
+  temperature: 1.0
+
+probe:
+  epochs: 100
+  batch_size: 512
+  lr: 1.0e-2
+  weight_decay: 0.0
+
+seed: 0
+device: auto
+log_every: 200
+out_dir: ./runs/cifar100_full

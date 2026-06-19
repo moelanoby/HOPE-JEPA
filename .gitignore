@@ -1,0 +1,37 @@
+# --- Data & outputs (never commit these) ---
+data/
+runs/
+*.pt
+*.ckpt
+*.pth
+*.tar.gz
+*.zip
+
+# --- Kaggle / notebook artifacts ---
+kaggle.json
+*.ipynb_checkpoints/
+/output/
+kaggle/working/
+kaggle/input/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# --- Logs ---
+*.log
+ssl_log.jsonl

@@ -1,0 +1,58 @@
+# cifar10_small.yaml — full CIFAR-10, modest HOPE stack, short pretrain.
+# Trainable on a single modest GPU (e.g. 8-12GB) in a few hours, or on the cloud.
+
+run_name: cifar10_small
+
+data:
+  dataset: cifar10
+  root: ./data
+  subset_train: null            # full 50k
+  subset_val: null
+  num_workers: 4
+
+model:
+  img_size: 32
+  patch_size: 4
+  d_model: 192
+  num_layers: 4
+  num_heads: 4
+  dropout: 0.0
+
+  titans:
+    num_persistent_memory: 8
+    d_hidden: 256
+    init_memory_std: 0.02
+
+  cms:
+    num_modules: 3
+    base_update_freq: 1
+    d_ff_multiplier: 2
+
+  jepa:
+    predictor_depth: 3
+    mask_ratio: 0.6
+
+sigreg:
+  enabled: true
+  sketch_dim: 64
+  target_scale: 1.0
+  weight: 1.0
+
+ssl:
+  epochs: 50
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 0.0
+  warmup_epochs: 2
+  temperature: 1.0
+
+probe:
+  epochs: 50
+  batch_size: 256
+  lr: 1.0e-2
+  weight_decay: 0.0
+
+seed: 0
+device: auto
+log_every: 100
+out_dir: ./runs/cifar10_small

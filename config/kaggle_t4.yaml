@@ -1,0 +1,62 @@
+# kaggle_t4.yaml — tuned for a single Kaggle GPU (T4 16GB or P100 16GB).
+# Full CIFAR-10, enough depth to be meaningful, fits the 16GB / 9-hour limits.
+# Run via the Kaggle notebook (notebooks/kaggle_hope_jepa.ipynb) or directly:
+#   python train_ssl.py --config config/kaggle_t4.yaml
+#   python linear_probe.py --config config/kaggle_t4.yaml \
+#       --checkpoint runs/kaggle_t4/checkpoints/ssl_final.pt
+
+run_name: kaggle_t4
+
+data:
+  dataset: cifar10
+  root: ./data
+  subset_train: null            # full 50k
+  subset_val: null
+  num_workers: 2                # Kaggle kernels give ~2-4 CPUs
+
+model:
+  img_size: 32
+  patch_size: 4
+  d_model: 256
+  num_layers: 4
+  num_heads: 4
+  dropout: 0.1
+
+  titans:
+    num_persistent_memory: 8
+    d_hidden: 256
+    init_memory_std: 0.02
+
+  cms:
+    num_modules: 3
+    base_update_freq: 1
+    d_ff_multiplier: 2
+
+  jepa:
+    predictor_depth: 3
+    mask_ratio: 0.6
+
+sigreg:
+  enabled: true
+  sketch_dim: 64
+  target_scale: 1.0
+  weight: 1.0
+
+ssl:
+  epochs: 100                   # ~30-50k steps; fits the 9h limit on a T4
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 0.0
+  warmup_epochs: 2
+  temperature: 1.0
+
+probe:
+  epochs: 50
+  batch_size: 256
+  lr: 1.0e-2
+  weight_decay: 0.0
+
+seed: 0
+device: auto                    # auto -> cuda on the Kaggle GPU
+log_every: 200
+out_dir: ./runs/kaggle_t4

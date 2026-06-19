@@ -1,0 +1,69 @@
+# tiny.yaml — correctness / smoke-test config.
+# Designed to run on CPU or a single weak GPU in a few minutes.
+# Proves the full pipeline (HOPE + per-layer JEPA + SIGReg) is wired correctly,
+# can overfit a batch, and trains end-to-end. NOT for final accuracy.
+
+run_name: tiny
+
+# --- Data ---
+data:
+  dataset: cifar10          # cifar10 | cifar100
+  root: ./data
+  subset_train: 2000        # only use this many images for a fast smoke run (null = full)
+  subset_val: 500
+  num_workers: 2
+
+# --- Model ---
+model:
+  img_size: 32
+  patch_size: 4             # 4x4 patches -> 64 tokens per image
+  d_model: 64               # embedding dim
+  num_layers: 2             # number of HOPE layers (each has its own JEPA head)
+  num_heads: 2              # heads inside the JEPA predictor transformer
+  dropout: 0.0
+
+  # Self-Modifying Titans memory mixer (per HOPE layer)
+  titans:
+    num_persistent_memory: 4     # persistent memory slots prepended every step
+    d_hidden: 128                # width of the learned-optimizer / surprise MLPs
+    init_memory_std: 0.02
+
+  # Continuum Memory System (per HOPE layer): stack of FFN Neural Learning Modules
+  cms:
+    num_modules: 2               # K NLMs with staggered update frequencies
+    base_update_freq: 1          # module k updates every base*2^k steps
+    d_ff_multiplier: 2           # FFN hidden = d_model * this
+
+  # Per-layer JEPA predictor
+  jepa:
+    predictor_depth: 2
+    mask_ratio: 0.6              # fraction of patches targeted/predicted
+
+# --- SIGReg regularizer (LeJEPA) ---
+sigreg:
+  enabled: true
+  sketch_dim: 32                 # random-projection dimension (m << d). null = full d_model
+  target_scale: 1.0              # sigma^2 isotropic target
+  weight: 1.0                    # lambda_sig
+
+# --- SSL pretraining ---
+ssl:
+  epochs: 3
+  batch_size: 128
+  lr: 3.0e-4
+  weight_decay: 0.0
+  warmup_epochs: 0
+  temperature: 1.0               # not used in L2 JEPA, kept for completeness
+
+# --- Linear probe (frozen backbone eval) ---
+probe:
+  epochs: 20
+  batch_size: 256
+  lr: 1.0e-2
+  weight_decay: 0.0
+
+# --- Misc ---
+seed: 0
+device: auto                    # auto | cpu | cuda
+log_every: 20
+out_dir: ./runs/tiny
