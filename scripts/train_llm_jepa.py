@@ -242,6 +242,9 @@ def main():
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=1,
                     help="Number of gradient accumulation steps (default: 1)")
+    ap.add_argument("--optimizer", default="adamw",
+                    choices=["adamw", "adamw_8bit", "paged_adamw_8bit", "paged_adamw_32bit"],
+                    help="Optimizer type to use (default: adamw)")
     ap.add_argument("--max_len", type=int, default=1024)
     ap.add_argument("--max_steps", type=int, default=0,
                     help="cap on total steps (0 = no cap)")
@@ -283,7 +286,19 @@ def main():
 
     # --- Optimizer (LoRA + new params) ---
     trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable, lr=cfg.training.lr, weight_decay=0.0)
+    if args.optimizer == "adamw":
+        opt = torch.optim.AdamW(trainable, lr=cfg.training.lr, weight_decay=0.0)
+    elif args.optimizer == "adamw_8bit":
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(trainable, lr=cfg.training.lr, weight_decay=0.0)
+    elif args.optimizer == "paged_adamw_8bit":
+        import bitsandbytes as bnb
+        opt = bnb.optim.PagedAdamW8bit(trainable, lr=cfg.training.lr, weight_decay=0.0)
+    elif args.optimizer == "paged_adamw_32bit":
+        import bitsandbytes as bnb
+        opt = bnb.optim.PagedAdamW32bit(trainable, lr=cfg.training.lr, weight_decay=0.0)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
     os.makedirs(args.output, exist_ok=True)
     step = 0
