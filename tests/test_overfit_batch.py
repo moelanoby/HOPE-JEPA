@@ -22,6 +22,7 @@ def _tiny_cfg(sigreg_weight=1.0):
         "model": {
             "img_size": 32, "patch_size": 4, "d_model": 48, "num_layers": 2,
             "num_heads": 4, "dropout": 0.0,
+            "num_slots": 4, "slot_div_weight": 0.1,
             "titans": {"num_persistent_memory": 4, "d_hidden": 96, "init_memory_std": 0.02},
             "cms": {"num_modules": 2, "base_update_freq": 1, "d_ff_multiplier": 2},
             "jepa": {"predictor_depth": 2, "mask_ratio": 0.5},
@@ -39,7 +40,9 @@ def _run(cfg, images, steps=150, lr=3e-3):
     for step in range(steps):
         opt.zero_grad()
         out = model(images, global_step=step)
-        loss, diag = ssl_loss(out, True, cfg["sigreg"]["weight"], model.sigreg)
+        loss, diag = ssl_loss(out, True, cfg["sigreg"]["weight"], model.sigreg,
+                              slots=model.slots,
+                              slot_div_weight=cfg["model"]["slot_div_weight"])
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

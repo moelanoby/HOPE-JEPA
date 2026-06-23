@@ -21,6 +21,7 @@ def _tiny_cfg():
         "model": {
             "img_size": 32, "patch_size": 4, "d_model": 32, "num_layers": 2,
             "num_heads": 2, "dropout": 0.0,
+            "num_slots": 4, "slot_div_weight": 0.1,
             "titans": {"num_persistent_memory": 4, "d_hidden": 64, "init_memory_std": 0.02},
             "cms": {"num_modules": 2, "base_update_freq": 1, "d_ff_multiplier": 2},
             "jepa": {"predictor_depth": 1, "mask_ratio": 0.6},
@@ -41,12 +42,15 @@ def main():
         img = torch.randn(4, 3, 32, 32)
         opt.zero_grad()
         out = model(img, global_step=step)
-        loss, diag = ssl_loss(out, True, cfg["sigreg"]["weight"], model.sigreg)
+        loss, diag = ssl_loss(out, True, cfg["sigreg"]["weight"], model.sigreg,
+                              slots=model.slots,
+                              slot_div_weight=cfg["model"]["slot_div_weight"])
         loss.backward()
         opt.step()
         assert torch.isfinite(loss).all(), "non-finite SSL loss"
         print(f"  ssl step {step}: total={diag['total']:.4f} jepa={diag['jepa']:.4f} "
-              f"sigreg={diag['sigreg']:.4f} eff_rank={diag['eff_rank']:.2f}")
+              f"sigreg={diag['sigreg']:.4f} div={diag['slot_div']:.4f} "
+              f"sparsity={diag['slot_sparsity']:.2f} eff_rank={diag['eff_rank']:.2f}")
 
     # --- linear probe: freeze backbone, train a linear head on synthetic labels ---
     for p in model.parameters():

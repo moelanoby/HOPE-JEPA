@@ -92,7 +92,9 @@ def main():
 
             opt.zero_grad()
             out = model(view1, global_step=global_step)
-            loss, diag = ssl_loss(out, sigreg_on, sig_w, model.sigreg)
+            loss, diag = ssl_loss(out, sigreg_on, sig_w, model.sigreg,
+                                  slots=model.slots,
+                                  slot_div_weight=model.slot_div_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -101,6 +103,7 @@ def main():
                 elapsed = time.time() - t0
                 print(f"  ep {epoch} step {global_step:5d}/{total_steps}  "
                       f"jepa={diag['jepa']:.4f} sigreg={diag['sigreg']:.4f} "
+                      f"div={diag['slot_div']:.4f} sparsity={diag['slot_sparsity']:.2f} "
                       f"eff_rank={diag['eff_rank']:.2f} lr={g['lr']:.2e} "
                       f"({elapsed:.0f}s)")
                 with open(log_path, "a") as f:

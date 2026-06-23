@@ -1,0 +1,68 @@
+# HOPE + slot-JEPA (+ optional JEPA-Reasoner) inside a HuggingFace LLM.
+#
+# Any Llama-family model works (Llama, Qwen2, Mistral, Gemma) via AutoModel:
+# just change `model_id`. `hope.d_hidden = 0` auto-fills from the base model's
+# hidden_size, so one config fits Qwen2.5-7B (3584) and LLaMA3-8B (4096) alike.
+#
+# Usage:
+#   cfg = HopeLlmConfig.from_dict(yaml.safe_load(open("config/llm_default.yaml")))
+#   model = HopeLLM(cfg)
+# (Training: scripts/train_llm_jepa.py -- 4-bit QLoRA, runs on a GPU box.)
+
+model_id: "Qwen/Qwen2.5-7B"
+
+load:
+  quantize: "4bit"            # "4bit" | "8bit" | "none" (4bit/8bit need CUDA)
+  device_map: "auto"
+  torch_dtype: "bfloat16"
+
+# How the HOPE layer enters the decoder stack:
+#   replace         -> target layers become HOPE wholesale
+#   insert          -> a bare HopeLayer spliced after each target layer
+#   swap_attention  -> only the layer's self_attn becomes a Titans MAC mixer
+placement: "swap_attention"
+target_layers: "last:3"      # "last:N" | "first:N" | "all" | "even"/"odd" | [list]
+
+hope:
+  d_hidden: 0                # 0 => auto = base model hidden_size
+  num_persistent_memory: 16
+  cms_num_modules: 4
+  cms_base_update_freq: 1
+  cms_d_ff_multiplier: 4
+  dropout: 0.0
+
+# Slot-JEPA auxiliary objective on the LLM's hidden states. Added to next-token
+# CE during (Q)LoRA finetuning: lambda_jepa * mean_l(slotJEPA).
+jepa:
+  enabled: true
+  layers: "last:3"           # which hidden layers get slot heads
+  num_slots: 8               # K diverging slots
+  predictor_depth: 2
+  num_heads: 8
+  mask_ratio: 0.4            # fraction of (real) BPE positions masked
+  weight: 1.0                # lambda_jepa
+
+# SIGReg (Balestriero & LeCun, LeJEPA) -- stops the self-targeting JEPA from
+# collapsing by pushing the hidden-state covariance toward isotropic Gaussian.
+sigreg:
+  enabled: true
+  sketch_dim: 128
+  target_scale: 1.0
+  weight: 1.0                # lambda_sig
+
+slot_div_weight: 0.1         # lambda_div: decorrelate the shared slots
+
+# JEPA-Reasoner (arXiv:2512.19171): latent reasoning rollout decoupled from
+# generation. Off by default; enable to add an R-step slot recurrence + Talker.
+reasoner:
+  enabled: false
+  steps: 4                   # R latent rollout steps
+  talker_dim_mult: 1.0       # talker hidden multiplier (1.0 => reuse lm_head)
+
+# QLoRA finetune knobs (exercised by scripts/train_llm_jepa.py on a GPU box).
+training:
+  qlora: true
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  lr: 2.0e-4

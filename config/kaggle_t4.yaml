@@ -21,6 +21,8 @@ model:
   num_layers: 4
   num_heads: 4
   dropout: 0.1
+  num_slots: 4              # K diverging slots shared across JEPA heads + readout
+  slot_div_weight: 0.1      # lambda on slot-embedding decorrelation
 
   titans:
     num_persistent_memory: 8

@@ -1,4 +1,9 @@
-"""Per-layer JEPA predictive head.
+"""Per-layer JEPA predictive head (NON-SLOT BASELINE / ablation).
+
+This is the original single-predictor JEPA head, kept for ablation against the
+slot-based predictor in `slots.py`. The model in `model.py` uses the slot
+variant (`SlotJEPAPredictor`); this module is not wired into the live model but
+is retained so the slot system can be A/B-tested by swapping heads.
 
 At each HOPE layer we have a token sequence z^l in [B, N, d] (the layer's
 output embedding of the *same* patch positions). JEPA predicts, *in latent

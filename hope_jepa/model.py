@@ -1,15 +1,25 @@
-"""The full HOPE-JEPA-SIGReg model.
+"""The full HOPE-JEPA-SIGReg model (slot-based JEPA + slot-assembled readout).
 
 Pipeline:
   image --patchify--> patch tokens --[L x HOPE layer]--> layer embeddings
                                                                   |
-                                  per-layer JEPA head predicts masked positions
+              per-layer SLOT JEPA head predicts masked positions via K diverging
+              slots, sparse-mixed by entmax-1.5 attention
                                                                   |
-                          SIGReg regularizes the embedding covariance
+                          SIGReg regularizes the embedding covariance;
+                          slot_divergence decorrelates the shared slots
+                                                                  |
+              pooled embedding = slot-assembled readout (sparse entmax mix of
+              per-slot summaries driven by the CLS token) -- the "full picture"
+
+The shared `slots` parameter ([K, d]) is the unifying object: it is (a) the
+mix-key for the JEPA slot heads, (b) the gather-query for the readout, and
+(c) the decorrelation target. One decomposition, used in three ways.
 
 `forward` returns everything the loss / training loop needs: the list of
-per-layer embeddings (for the JEPA losses and SIGReg), and a pooled [CLS]
-embedding used only by the downstream linear probe.
+per-layer embeddings (for SIGReg), per-layer JEPA losses, the slot mixing
+weights (for the sparsity diagnostic), and the slot-assembled pooled embedding
+used only by the downstream linear probe.
 """
 
 from __future__ import annotations
@@ -18,12 +28,18 @@ import torch
 import torch.nn as nn
 
 from .hope import HopeLayer
-from .jepa import JEPAPredictor
 from .sigreg import SIGReg
+from .slots import SlotJEPAPredictor, SlotReadout
 
 
 class HopeJepaModel(nn.Module):
-    """Patch embedding + stack of HOPE layers + per-layer JEPA predictors + SIGReg."""
+    """Patch embedding + stack of HOPE layers + slot JEPA predictors + SIGReg.
+
+    Slot system (see `slots.py`): K shared slot embeddings drive both the
+    per-layer slot-JEPA predictive heads (diverging per-slot predictions
+    sparse-mixed by entmax-1.5) and the slot-assembled readout that produces the
+    pooled embedding for the linear probe.
+    """
 
     def __init__(self, cfg: dict):
         super().__init__()
@@ -33,13 +49,16 @@ class HopeJepaModel(nn.Module):
         self.patch_size = m["patch_size"]
         self.d_model = m["d_model"]
         self.num_layers = m["num_layers"]
+        self.num_slots = int(m.get("num_slots", 4))
+        self.slot_div_weight = float(m.get("slot_div_weight", 0.1))
         assert self.img_size % self.patch_size == 0, "img_size must be divisible by patch_size"
         self.num_patches = (self.img_size // self.patch_size) ** 2
         self.in_dim = 3 * self.patch_size * self.patch_size
 
         # Patch embedding: flattened patch pixels -> d_model.
         self.patch_embed = nn.Linear(self.in_dim, self.d_model)
-        # Positional embedding + a CLS token (CLS used only by the linear probe).
+        # Positional embedding + a CLS token. CLS now drives the slot-mix in the
+        # readout rather than *being* the pooled output (see SlotReadout).
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
         nn.init.normal_(self.cls_token, std=0.02)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, self.d_model))
@@ -63,13 +82,20 @@ class HopeJepaModel(nn.Module):
             for _ in range(self.num_layers)
         ])
 
-        # Per-layer JEPA predictors.
+        # Shared slot embeddings: the unifying object across the JEPA slot heads
+        # (mix keys), the readout (gather queries), and the divergence penalty.
+        self.slots = nn.Parameter(torch.randn(self.num_slots, self.d_model) * 0.02)
+
+        # Per-layer slot JEPA predictors.
         j = m["jepa"]
         self.jepa_heads = nn.ModuleList([
-            JEPAPredictor(self.d_model, m["num_heads"], j["predictor_depth"],
-                          m.get("dropout", 0.0))
+            SlotJEPAPredictor(self.d_model, m["num_heads"], self.num_slots,
+                              j["predictor_depth"], m.get("dropout", 0.0))
             for _ in range(self.num_layers)
         ])
+
+        # Slot-assembled readout -> pooled embedding for the linear probe.
+        self.slot_readout = SlotReadout(self.d_model, self.num_slots)
 
         # SIGReg regularizer (applied to the pooled layer embeddings).
         s = cfg["sigreg"]
@@ -93,7 +119,7 @@ class HopeJepaModel(nn.Module):
 
     def forward(self, images: torch.Tensor, global_step: int = 0,
                 mask: torch.Tensor | None = None):
-        """Run the backbone and per-layer JEPA prediction.
+        """Run the backbone and per-layer slot-JEPA prediction.
 
         Args:
             images: [B, C, H, W] input batch (a single augmented view).
@@ -104,11 +130,16 @@ class HopeJepaModel(nn.Module):
         Returns:
             dict with:
               layer_embeddings: list of [B, N+1, d] per layer.
-              pooled: [B, d] CLS embedding from the final layer (for probing).
+              pooled: [B, d] slot-assembled embedding from the final layer
+                      (sparse entmax mix of per-slot summaries; for probing).
               mask: [B, N] the mask actually used.
               jepa_losses: list of per-layer scalar losses.
+              slot_weights: list of per-layer entmax weight tensors, each
+                            [n, Nt, K] (ragged over the batch). The loss uses
+                            these to report the genuine per-target sparsity.
         """
         from .data import random_mask
+        from .slots import jepa_slot_layer_loss
 
         x = self.embed_patches(images)                         # [B, N+1, d]
         B = x.shape[0]
@@ -119,29 +150,38 @@ class HopeJepaModel(nn.Module):
 
         layer_embeddings = []
         jepa_losses = []
+        slot_weights = []
         z = x
         for hope_layer, jepa_head in zip(self.hope_layers, self.jepa_heads):
             z = hope_layer(z, global_step)                     # [B, N+1, d]
             layer_embeddings.append(z)
-            # JEPA operates on patch tokens (drop CLS), using this layer's own
-            # embeddings as targets. Detach the *input* to the target path? No:
-            # LeJEPA does not use stop-gradient. SIGReg prevents collapse.
-            from .jepa import jepa_layer_loss
+            # Slot JEPA operates on patch tokens (drop CLS), using this layer's
+            # own embeddings as targets. No stop-gradient (LeJEPA); SIGReg +
+            # slot_divergence prevent collapse.
             z_patches = z[:, 1:, :]                             # [B, N, d]
-            jepa_losses.append(jepa_layer_loss(z_patches, mask, jepa_head))
+            loss_l, w_l = jepa_slot_layer_loss(z_patches, mask, jepa_head,
+                                               self.slots)
+            jepa_losses.append(loss_l)
+            slot_weights.append(w_l.detach())
 
-        pooled = layer_embeddings[-1][:, 0, :]                 # CLS of last layer
+        # Slot-assembled readout from the final layer (the "full picture").
+        pooled = self.slot_readout(layer_embeddings[-1], self.slots)
         return {
             "layer_embeddings": layer_embeddings,
             "pooled": pooled,
             "mask": mask,
             "jepa_losses": jepa_losses,
+            "slot_weights": slot_weights,
         }
 
     # ------------------------------------------------------------------
     def encode(self, images: torch.Tensor, global_step: int = 0) -> torch.Tensor:
-        """Convenience: return just the pooled [B, d] embedding for the probe."""
+        """Convenience: return just the pooled [B, d] embedding for the probe.
+
+        Uses the slot-assembled readout so probing sees the same representation
+        that training optimizes.
+        """
         x = self.embed_patches(images)
         for hope_layer in self.hope_layers:
             x = hope_layer(x, global_step)
-        return x[:, 0, :]
+        return self.slot_readout(x, self.slots)

@@ -21,6 +21,8 @@ model:
   num_layers: 2             # number of HOPE layers (each has its own JEPA head)
   num_heads: 2              # heads inside the JEPA predictor transformer
   dropout: 0.0
+  num_slots: 4              # K diverging slots shared across JEPA heads + readout
+  slot_div_weight: 0.1      # lambda on slot-embedding decorrelation
 
   # Self-Modifying Titans memory mixer (per HOPE layer)
   titans:

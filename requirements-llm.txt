@@ -1,0 +1,16 @@
+# Extra dependencies for putting the HOPE / slot-JEPA module into HuggingFace
+# Llama-family LLMs (Qwen2.5-7B, LLaMA3-8B, Mistral, Gemma, ...) via AutoModel.
+#
+# Install on top of requirements.txt:
+#   pip install -r requirements-llm.txt
+#
+# NOTE: bitsandbytes (QLoRA 4-bit) needs a CUDA build and is not exercised on
+# this machine -- it is only used by scripts/train_llm_jepa.py, which is meant
+# to run on a GPU box. The CPU smoke test needs only transformers + peft.
+
+transformers>=4.44
+accelerate>=0.34
+peft>=0.12
+datasets>=2.20
+tokenizers>=0.19
+bitsandbytes>=0.43   # QLoRA 4-bit quantization (CUDA only)
