@@ -54,7 +54,7 @@ def apply_qlora(model: HopeLLM, cfg: HopeLlmConfig):
     from scratch alongside the LoRA adapters on the pretrained weights.
     """
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES as TARGETS
+    from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING as TARGETS
 
     base = model.model  # the underlying HF CausalLM
     if cfg.training.qlora:
