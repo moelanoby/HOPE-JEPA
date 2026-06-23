@@ -103,7 +103,19 @@ def test_jepa():
     # predictor params should have grad
     g = sum(p.grad.abs().sum().item() for p in pred.parameters() if p.grad is not None)
     assert g > 0, "no grads reached the predictor"
-    print(f"  [ok] JEPA layer loss = {loss.item():.4f}, grads flow")
+
+    # Test with variable mask lengths (different Nt per batch item)
+    mask_var = torch.zeros(2, 64, dtype=torch.bool)
+    mask_var[0, :10] = True
+    mask_var[1, :15] = True
+    pred.zero_grad()
+    loss_var = jepa_layer_loss(z, mask_var, pred)
+    assert loss_var.ndim == 0
+    loss_var.backward()
+    g_var = sum(p.grad.abs().sum().item() for p in pred.parameters() if p.grad is not None)
+    assert g_var > 0
+    print(f"  [ok] JEPA layer loss = {loss.item():.4f} (var={loss_var.item():.4f}), grads flow")
+
 
 
 def test_sigreg_extremes():
@@ -167,6 +179,23 @@ def test_slots():
     assert head_grad > 0, "no grads reached the slot predictor"
     assert slots.grad is not None and slots.grad.abs().sum().item() > 0, \
         "no grads reached the shared slots through mixing"
+
+    # Test with variable mask lengths (different Nt per batch item)
+    mask_var = torch.zeros(2, 64, dtype=torch.bool)
+    mask_var[0, :10] = True
+    mask_var[1, :15] = True
+    pred.zero_grad()
+    if slots.grad is not None:
+        slots.grad.zero_n__ = 0
+        slots.grad = None
+    loss_var, w_var = jepa_slot_layer_loss(z, mask_var, pred, slots)
+    assert loss_var.ndim == 0
+    assert w_var.dim() == 3 and w_var.shape[-1] == K, w_var.shape
+    loss_var.backward()
+    head_grad_var = sum(p.grad.abs().sum().item() for p in pred.parameters() if p.grad is not None)
+    assert head_grad_var > 0
+    assert slots.grad is not None and slots.grad.abs().sum().item() > 0
+
 
     # Divergence: correlated slots -> high, orthogonal slots -> ~0.
     base = torch.randn(1, d)

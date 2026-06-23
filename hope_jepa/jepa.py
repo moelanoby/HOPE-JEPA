@@ -109,6 +109,11 @@ def jepa_layer_loss(z: torch.Tensor, mask: torch.Tensor,
 
     if not preds_list:
         return z.new_zeros(())
-    preds = torch.cat(preds_list, dim=0)
-    targets = torch.cat(targets_list, dim=0)
+    shapes = [p.shape for p in preds_list]
+    if all(s == shapes[0] for s in shapes):
+        preds = torch.cat(preds_list, dim=0)
+        targets = torch.cat(targets_list, dim=0)
+    else:
+        preds = torch.cat([p.view(-1, d) for p in preds_list], dim=0)
+        targets = torch.cat([t.view(-1, d) for t in targets_list], dim=0)
     return F.mse_loss(preds, targets)

@@ -187,9 +187,15 @@ def jepa_slot_layer_loss(z: torch.Tensor, mask: torch.Tensor,
         zero = z.new_zeros(())
         empty_w = z.new_zeros(0, 0, predictor.num_slots)
         return zero, empty_w
-    preds = torch.cat(preds_list, dim=0)
-    targets = torch.cat(targets_list, dim=0)
-    weights = torch.cat(weights_list, dim=0)                 # [n, Nt_i, K] (ragged)
+    shapes = [p.shape for p in preds_list]
+    if all(s == shapes[0] for s in shapes):
+        preds = torch.cat(preds_list, dim=0)
+        targets = torch.cat(targets_list, dim=0)
+        weights = torch.cat(weights_list, dim=0)
+    else:
+        preds = torch.cat([p.view(-1, d) for p in preds_list], dim=0)
+        targets = torch.cat([t.view(-1, d) for t in targets_list], dim=0)
+        weights = torch.cat([w.view(-1, predictor.num_slots) for w in weights_list], dim=0).unsqueeze(0)
     loss = F.mse_loss(preds, targets)
     return loss, weights
 
