@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 def _erf_g(x: torch.Tensor) -> torch.Tensor:
@@ -81,26 +82,14 @@ class NeuralLongTermMemory(nn.Module):
         stim = torch.bmm(value.unsqueeze(2), key.unsqueeze(1))  # [B, d, d]
         return stim / (d ** 0.5)
 
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the learned memory recurrence over the token sequence.
-
-        Args:
-            tokens: [B, N, d] sequence of patch tokens.
-        Returns:
-            retrieval: [B, N, d]  the memory retrieval read at each step.
-            final_M:   [B, d, d]  final memory state (useful for diagnostics).
-        """
-        B, N, d = tokens.shape
-        device = tokens.device
-
-        # Per-batch memory state, initialized from the learned parameter.
-        M = self.M0.unsqueeze(0).expand(B, -1, -1).contiguous()  # [B, d, d]
-
-        retrievals = []
-        for t in range(N):
-            tok = tokens[:, t, :]                    # [B, d]
+    def _step_chunk(self, M: torch.Tensor, tokens_sub: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B, num_steps, d = tokens_sub.shape
+        M_curr = M
+        local_retrievals = []
+        for t in range(num_steps):
+            tok = tokens_sub[:, t, :]                    # [B, d]
             # Read: a simple linear-attention-style query over M.
-            retrieval = torch.bmm(M, tok.unsqueeze(-1)).squeeze(-1)  # [B, d]
+            retrieval = torch.bmm(M_curr, tok.unsqueeze(-1)).squeeze(-1)  # [B, d]
             # Stimulus: rank-1 write from (value=key=tok).
             stim = self._stimulus(tok, tok)          # [B, d, d]
             stim_vec = stim.mean(dim=1)              # [B, d] reduced view for heads
@@ -130,12 +119,43 @@ class NeuralLongTermMemory(nn.Module):
             decay = decay.view(B, 1, d)
 
             # L2-style self-update of the memory. Fully differentiable (BPTT).
-            M = (1.0 - alpha * decay) * M + alpha * stim
+            M_curr = (1.0 - alpha * decay) * M_curr + alpha * stim
 
-            retrievals.append(retrieval)
+            local_retrievals.append(retrieval)
 
-        retrieval = torch.stack(retrievals, dim=1)  # [B, N, d]
+        return M_curr, torch.stack(local_retrievals, dim=1)
+
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the learned memory recurrence over the token sequence.
+
+        Args:
+            tokens: [B, N, d] sequence of patch tokens.
+        Returns:
+            retrieval: [B, N, d]  the memory retrieval read at each step.
+            final_M:   [B, d, d]  final memory state (useful for diagnostics).
+        """
+        B, N, d = tokens.shape
+        device = tokens.device
+
+        # Per-batch memory state, initialized from the learned parameter.
+        M = self.M0.unsqueeze(0).expand(B, -1, -1).contiguous()  # [B, d, d]
+
+        chunk_size = 64
+        retrievals = []
+        
+        for i in range(0, N, chunk_size):
+            tokens_sub = tokens[:, i:i+chunk_size]
+            if self.training and tokens.requires_grad:
+                M, local_ret = torch.utils.checkpoint.checkpoint(
+                    self._step_chunk, M, tokens_sub, use_reentrant=False
+                )
+            else:
+                M, local_ret = self._step_chunk(M, tokens_sub)
+            retrievals.append(local_ret)
+
+        retrieval = torch.cat(retrievals, dim=1)  # [B, N, d]
         return retrieval, M
+
 
 
 class MACMixer(nn.Module):

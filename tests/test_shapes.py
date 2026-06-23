@@ -186,7 +186,7 @@ def test_slots():
     mask_var[1, :15] = True
     pred.zero_grad()
     if slots.grad is not None:
-        slots.grad.zero_n__ = 0
+        slots.grad.zero_()
         slots.grad = None
     loss_var, w_var = jepa_slot_layer_loss(z, mask_var, pred, slots)
     assert loss_var.ndim == 0
@@ -236,6 +236,7 @@ def test_full_model():
 
 
 def main():
+    torch.manual_seed(42)
     tests = [
         ("patchify", test_patchify),
         ("mask", test_mask),
