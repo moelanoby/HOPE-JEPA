@@ -10,8 +10,9 @@ What it does, per the approved plan:
   1. Load the base model with `BitsAndBytesConfig(load_in_4bit=True)` +
      `prepare_model_for_kbit_training`.
   2. Wrap base params with `peft.LoraConfig`; keep the new HOPE / slot-JEPA /
-     Reasoner params FULLY trainable via `modules_to_save` (these are new, not
-     quantized, and should learn from scratch).
+     Reasoner params FULLY trainable (they live on the wrapper, outside the
+     quantized base, so they are full-precision by default and re-enabled
+     explicitly after wrapping).
   3. Build `HopeLLM(cfg)` -- which splices HOPE layers and attaches the slot
      JEPA objective (+ Reasoner if enabled).
   4. Loop: set_global_step -> HopeLLM.forward (CE + slot-JEPA + SIGReg + div
@@ -49,36 +50,28 @@ def apply_qlora(model: HopeLLM, cfg: HopeLlmConfig):
     """Wrap the *base HF model's* params in LoRA adapters; keep all NEW
     (HOPE / slot-JEPA / Reasoner) modules fully trainable.
 
-    `modules_to_save` makes a full-precision trainable copy of the named
-    modules, so the HOPE blocks and the JEPA heads are NOT quantized and learn
-    from scratch alongside the LoRA adapters on the pretrained weights.
+    Important: the new modules live on the `HopeLLM` wrapper, OUTSIDE the
+    quantized base model. They are therefore already full-precision and not
+    frozen by `prepare_model_for_kbit_training` (which only freezes the base).
+    We must NOT put them in `modules_to_save` -- that peft option is for
+    replacing *quantized base* modules with fp32 copies, and matching it by
+    scraped leaf-name suffixes collides with `target_modules`, raising
+    "No modules were targeted for adaptation". So we leave it at None and just
+    LoRA the base attention projections.
     """
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING as TARGETS
 
     base = model.model  # the underlying HF CausalLM
     if cfg.training.qlora:
-        # k-bit-safe: freeze norm, enable grad checkpointing-friendly inputs.
+        # k-bit-safe: freeze base norms, enable grad-checkpointing-friendly
+        # inputs. Does NOT touch the wrapper's new modules (jepa/reasoner).
         base = prepare_model_for_kbit_training(base)
 
     # Target the attention projections of the base model (q/k/v/o for Llama).
     # Auto-resolve the target module names from the model's architecture.
     arch = getattr(base.config, "architectures", ["LlamaForCausalLM"])[0]
     target_modules = TARGETS.get(arch, ["q_proj", "v_proj", "k_proj", "o_proj"])
-
-    # Collect the names of every NEW module we introduced (HOPE blocks + JEPA
-    # heads + slots + sigreg + reasoner). These live on the HopeLLM wrapper, so
-    # we locate them by type via the public classes.
-    from hope_jepa.llm.hope_block import HopeDecoderLayer, MACAttnAdapter
-    new_modules = []
-    for name, mod in model.named_modules():
-        if isinstance(mod, (HopeDecoderLayer, MACAttnAdapter)) or \
-           name.startswith("jepa.") or name.startswith("reasoner."):
-            # peft matches by suffix; use the leaf name path.
-            new_modules.append(name.split(".")[-1])
-    # Deduplicate (many layers share the suffix "hope", "mix_q", etc.) -- peft
-    # saves whole modules, so a handful of distinct suffixes covers them.
-    new_modules = sorted(set(new_modules)) or None
 
     peft_cfg = LoraConfig(
         r=cfg.training.lora_r,
@@ -87,10 +80,26 @@ def apply_qlora(model: HopeLLM, cfg: HopeLlmConfig):
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=target_modules,
-        modules_to_save=new_modules,   # keep new HOPE/JEPA/Reasoner params trainable
+        # modules_to_save intentionally None: the new HOPE/JEPA/Reasoner
+        # modules are not part of the quantized base, so they're already
+        # trainable -- no peft copy needed.
     )
     # Wrap the base model in-place; the HopeLLM wrapper still owns it.
     model.model = get_peft_model(base, peft_cfg)
+
+    # Explicitly (re)enable training on the new HOPE / slot-JEPA / Reasoner
+    # modules. They live on the wrapper, outside the LoRA-wrapped base, but we
+    # make sure here regardless of what prepare_model_for_kbit_training /
+    # get_peft_model did to requires_grad upstream of them.
+    from hope_jepa.llm.hope_block import HopeDecoderLayer, MACAttnAdapter
+    n_unfrozen = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, (HopeDecoderLayer, MACAttnAdapter)) or \
+           name.startswith("jepa.") or name.startswith("reasoner."):
+            for p in mod.parameters(recurse=True):
+                if not p.requires_grad:
+                    p.requires_grad_(True)
+                    n_unfrozen += 1
     return model
 
 
