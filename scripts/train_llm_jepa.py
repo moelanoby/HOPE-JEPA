@@ -240,9 +240,15 @@ def main():
     ap.add_argument("--output", default="runs/hope_jepa")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--grad_accum", type=int, default=1,
+                    help="Number of gradient accumulation steps (default: 1)")
     ap.add_argument("--max_len", type=int, default=1024)
     ap.add_argument("--max_steps", type=int, default=0,
                     help="cap on total steps (0 = no cap)")
+    ap.add_argument("--gradient_checkpointing", action="store_true", default=True,
+                    help="Enable gradient checkpointing (default: True)")
+    ap.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing",
+                    help="Disable gradient checkpointing")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -250,6 +256,17 @@ def main():
     # --- Model ---
     model = HopeLLM(cfg)                       # loads + splices HOPE layers
     model = apply_qlora(model, cfg)            # 4-bit QLoRA on base, new params trainable
+    
+    if args.gradient_checkpointing:
+        # Try to pass gradient_checkpointing_kwargs to avoid the PyTorch 2.9 warning
+        try:
+            model.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            try:
+                model.model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.train()
@@ -270,28 +287,55 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
     step = 0
+    accum_steps = args.grad_accum
+    opt.zero_grad()
+    
     for epoch in range(args.epochs):
+        batch_idx = 0
+        out = None
         for input_ids, attn_mask, labels in iterate_batches(
                 tokenizer, ds, args.max_len, args.batch_size, device,
                 text_column=args.text_column,
                 json_field=args.json_field):
             set_global_step(model, step)
+            
             out = model(input_ids=input_ids, attention_mask=attn_mask,
                         labels=labels)
-            opt.zero_grad()
-            out.loss.backward()
+            
+            loss = out.loss / accum_steps
+            loss.backward()
+            
+            batch_idx += 1
+            if batch_idx % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                opt.step()
+                opt.zero_grad()
+                step += 1
+                
+                d = out.jepa_diag
+                print(f"[ep{epoch} s{step}] loss={out.loss.item():.4f} "
+                      f"ce={out.ce_loss.item():.4f} jepa={d['jepa']:.4f} "
+                      f"sigreg={d['sigreg']:.4f} div={d['slot_div']:.4f} "
+                      f"sparse={d['slot_sparsity']:.3f} effrank={d['eff_rank']:.1f}",
+                      flush=True)
+            
+            if args.max_steps and step >= args.max_steps:
+                break
+                
+        # End of epoch: step remaining gradients
+        if batch_idx % accum_steps != 0 and out is not None:
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
-
+            opt.zero_grad()
+            step += 1
+            
             d = out.jepa_diag
             print(f"[ep{epoch} s{step}] loss={out.loss.item():.4f} "
                   f"ce={out.ce_loss.item():.4f} jepa={d['jepa']:.4f} "
                   f"sigreg={d['sigreg']:.4f} div={d['slot_div']:.4f} "
-                  f"sparse={d['slot_sparsity']:.3f} effrank={d['eff_rank']:.1f}",
+                  f"sparse={d['slot_sparsity']:.3f} effrank={d['eff_rank']:.1f} (epoch end)",
                   flush=True)
-            step += 1
-            if args.max_steps and step >= args.max_steps:
-                break
+                  
         if args.max_steps and step >= args.max_steps:
             break
 
