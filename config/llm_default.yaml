@@ -9,7 +9,7 @@
 #   model = HopeLLM(cfg)
 # (Training: scripts/train_llm_jepa.py -- 4-bit QLoRA, runs on a GPU box.)
 
-model_id: "Qwen/Qwen2.5-7B"
+model_id: "Qwen/Qwen2.5-3B"
 
 load:
   quantize: "4bit"            # "4bit" | "8bit" | "none" (4bit/8bit need CUDA)
