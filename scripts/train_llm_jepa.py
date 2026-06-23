@@ -19,8 +19,13 @@ What it does, per the approved plan:
      + optional predict-ahead) -> backward -> opt.step -> global_step++.
 
 Usage:
+    # FABLE.5 traces (auto-detects row_json -> parses JSON -> pulls "completion"):
     python scripts/train_llm_jepa.py --config config/llm_default.yaml \
-        --dataset <hf-dataset-or-jsonl> --output runs/qwen_hope_jepa
+        --dataset Crownelius/Complete-FABLE.5-traces-2M --output runs/fable_hope
+
+    # Standard {"text": ...} dataset:
+    python scripts/train_llm_jepa.py --config config/llm_default.yaml \
+        --dataset tatsu-lab/alpaca --text_column instruction --output runs/alpaca
 """
 
 from __future__ import annotations
@@ -104,33 +109,134 @@ def apply_qlora(model: HopeLLM, cfg: HopeLlmConfig):
 
 
 # ---------------------------------------------------------------------------
-def iterate_batches(tokenizer, dataset, max_len: int, batch_size: int, device):
-    """Yield (input_ids, attention_mask, labels) batches from a text dataset.
+def _extract_text(ex: dict, text_column: str | None,
+                  json_field: str | None) -> str:
+    """Pull a plain-text string out of one dataset row.
 
-    Expects `dataset` to be an iterable of {"text": str} (the HF `datasets`
-    convention). Packs each example as its own block: labels = input_ids (HF
-    shifts internally). Padding tokens are masked in both attention_mask and
-    labels.
+    Three cases:
+      1. `text_column` is given (or auto-detected) and the row's value is a
+         plain string -> return it. This covers {"text": ...} and the FABLE.5
+         dataset's {"row_json": "<json string>"} when you WANT the raw json.
+      2. The column holds a JSON string (FABLE.5 `row_json`): parse it and pull
+         `json_field` (default: try "completion", then "message.content", then
+         "content"). Returns "" if the field is missing or the row is a
+         non-text operation (enqueue/dequeue/etc.).
+      3. Nothing usable -> "" (the caller skips it).
+    """
+    import json as _json
+
+    col = text_column
+    if col is None or col not in ex:
+        # auto-pick: prefer an explicit text column, else row_json.
+        for cand in ("text", "row_json", "content", "prompt", "completion"):
+            if cand in ex:
+                col = cand
+                break
+    if col is None or col not in ex:
+        return ""
+    val = ex[col]
+    if not isinstance(val, str):
+        # Some datasets store lists/dicts natively (not as a json string).
+        if isinstance(val, (list, dict)):
+            val = _json.dumps(val)
+        else:
+            val = str(val)
+
+    # If the column is a JSON string and the user wants a nested field, parse.
+    looks_json = val.lstrip().startswith(("{", "["))
+    if looks_json and (json_field is not None or col == "row_json"):
+        try:
+            obj = _json.loads(val)
+        except (ValueError, TypeError):
+            return val  # not actually json; return as-is
+        fields = [json_field] if json_field else \
+                 ["completion", "content", "text", "answer"]
+        for f in fields:
+            v = _dig_field(obj, f)
+            if isinstance(v, str) and v.strip():
+                return v
+        # message.content style (list of messages)
+        if isinstance(obj, dict) and "message" in obj:
+            mc = _dig_field(obj["message"], "content")
+            if isinstance(mc, str) and mc.strip():
+                return mc
+        return ""   # row exists but has no usable text (e.g. enqueue/dequeue)
+    return val
+
+
+def _dig_field(obj, field: str):
+    """Get obj[field] or obj[field][.sub...] supporting dotted paths and the
+    common 'content' nested under message/choices."""
+    cur = obj
+    for part in field.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return None
+    return cur
+
+
+def iterate_batches(tokenizer, dataset, max_len: int, batch_size: int, device,
+                    text_column: str | None = None,
+                    json_field: str | None = None,
+                    max_rows: int = 0):
+    """Lazily yield (input_ids, attention_mask, labels) batches.
+
+    LAZY: rows are streamed (no materializing 2M strings into memory). For each
+    row we extract a plain-text string via `_extract_text` and skip empties
+    (FABLE.5 has many non-text operation rows). When a full `batch_size` of
+    non-empty texts is collected, tokenize+pad and yield.
+
+    Args:
+        text_column: column to read (None => auto-detect 'text'/'row_json'/...).
+        json_field:  if the column is a JSON string, pull this nested field
+                     (None => try completion/content/text/answer).
+        max_rows:    stop after scanning this many rows (0 = no cap).
     """
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None \
         else tokenizer.eos_token_id
-    texts = [ex["text"] for ex in dataset]
-    for i in range(0, len(texts), batch_size):
-        chunk = texts[i:i + batch_size]
-        enc = tokenizer(chunk, return_tensors="pt", padding="max_length",
-                        truncation=True, max_length=max_len)
-        input_ids = enc["input_ids"]
-        attn = enc["attention_mask"]
-        labels = input_ids.clone()
-        labels[input_ids == pad_id] = -100
-        yield (input_ids.to(device), attn.to(device), labels.to(device))
+    buf = []
+    scanned = 0
+    for ex in dataset:
+        scanned += 1
+        if max_rows and scanned > max_rows:
+            break
+        txt = _extract_text(ex, text_column, json_field)
+        if not txt or not txt.strip():
+            continue
+        buf.append(txt)
+        if len(buf) >= batch_size:
+            yield _encode_batch(tokenizer, buf, max_len, pad_id, device)
+            buf = []
+    if buf:   # final partial batch
+        yield _encode_batch(tokenizer, buf, max_len, pad_id, device)
+
+
+def _encode_batch(tokenizer, texts, max_len, pad_id, device):
+    import torch
+    enc = tokenizer(texts, return_tensors="pt", padding="max_length",
+                    truncation=True, max_length=max_len)
+    input_ids = enc["input_ids"]
+    attn = enc["attention_mask"]
+    labels = input_ids.clone()
+    labels[input_ids == pad_id] = -100
+    return (input_ids.to(device), attn.to(device), labels.to(device))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/llm_default.yaml")
     ap.add_argument("--dataset", required=True,
-                    help="HF dataset id or path to a jsonl with a 'text' field")
+                    help="HF dataset id or path to a jsonl/parquet")
+    ap.add_argument("--text_column", default=None,
+                    help="Column holding the text (auto-detects 'text'/'row_json'/"
+                         "'content'/'prompt'/'completion' if not set)")
+    ap.add_argument("--json_field", default=None,
+                    help="Nested field to extract when the column is a JSON string "
+                         "(auto-tries 'completion'/'content'/'text'/'answer' for "
+                         "row_json-style datasets like FABLE.5)")
     ap.add_argument("--output", default="runs/hope_jepa")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=4)
@@ -166,7 +272,9 @@ def main():
     step = 0
     for epoch in range(args.epochs):
         for input_ids, attn_mask, labels in iterate_batches(
-                tokenizer, ds, args.max_len, args.batch_size, device):
+                tokenizer, ds, args.max_len, args.batch_size, device,
+                text_column=args.text_column,
+                json_field=args.json_field):
             set_global_step(model, step)
             out = model(input_ids=input_ids, attention_mask=attn_mask,
                         labels=labels)
