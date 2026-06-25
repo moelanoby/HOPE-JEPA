@@ -1,0 +1,69 @@
+# EGGROLL self-play RL phase for the HOPE-JEPA LLM.
+#
+# This is the SECOND training phase. The first (scripts/train_llm_jepa.py)
+# does slot-JEPA + next-token CE (Q)LoRA finetuning and produces a center
+# model theta referenced by `model.hope_config` below. EGGROLL then evolves
+# theta via adversarial self-play: 3 injectors make bugs in real repo
+# snapshots, 12 fixers race to fix them, validated against the repo's real
+# test suite (SWE-RL style). The best fixer per batch contributes most to
+# the center update (rank-shaped EGGROLL utility); fixers are rewarded for
+# using FEWER tools and retries.
+#
+# Usage:
+#   python scripts/train_eggroll.py --config config/eggroll_default.yaml \
+#       --output runs/eggroll/run1
+#
+# Point `repos` at one or many local repo paths OR git URLs. The agents work
+# against copies (snapshots) -- never your working tree -- and run the repo's
+# own test command inside a sandboxed cwd (no network, CPU/time limited).
+#
+#   WARNING: agents emit code (patches + tools) that is executed. Only point
+#   `repos` at repos you trust, and ideally inside a container. The sandbox
+#   strips network env vars and caps CPU/time, but that is defense-in-depth,
+#   not a hard boundary.
+
+# --- The repo environment (SWE-RL style) ---
+repos:
+  - "/path/to/local/repo"            # local path OR git URL; 1..N supported
+  # - "https://github.com/owner/repo.git"
+max_files_per_snapshot: 20
+test_command: "python -m pytest -q"
+workdir: "runs/eggroll/sandboxes"
+test_timeout: 60
+
+# --- Population roles (single shared center theta) ---
+roles:
+  num_injectors: 3
+  num_fixers: 12
+  tool_fixers: 6      # of the 12 fixers, these can author + call tools
+  bare_fixers: 6      # the rest get edits only
+
+# --- EGGROLL evolution strategies (arXiv:2511.16652) ---
+eggroll:
+  rank: 8             # low-rank r: eps = A @ B^T (the GPU-efficiency lever)
+  sigma: 0.02         # perturbation scale
+  lr: 0.01            # eta
+  antithetic: true    # use +/- eps to halve variance
+  utility_shape: "log"   # rank shaping; the top member dominates the theta update
+
+# --- Reward shaping: GTPO for injectors, GRPO-S for fixers ---
+reward:
+  tool_penalty: 0.1      # per tool a fixer uses (favor few tools)
+  retry_penalty: 0.05    # per retry/turn (favor fast fixes)
+  speed_bonus: 0.2       # bonus for the fastest fixer in the batch
+  edit_sim_weight: 0.4   # SWE-RL: similarity of fix to the oracle (inverse injection)
+  test_pass_weight: 0.6  # SWE-RL: real test-suite pass rate
+  entropy_weight: 0.01   # GRPO-S/GTPO dynamic entropy exploration bonus
+
+# --- The center model (reuses the HOPE+JEPA model you pretrained) ---
+model:
+  hope_config: "config/llm_default.yaml"   # an llm_default-style YAML
+  quantize: "4bit"        # "4bit" | "8bit" | "none" (CPU/smoke = none)
+
+# --- Training loop ---
+train:
+  generations: 50
+  max_turns: 8            # action budget per agent per injection
+  seed: 0
+  log_every: 1
+  ckpt_every: 10

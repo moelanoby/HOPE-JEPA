@@ -5,3 +5,14 @@ numpy>=1.24
 einops>=0.7
 pyyaml>=6.0
 tqdm>=4.65
+
+# --- LLM Phase Dependencies ---
+# Required for scripts/train_llm_jepa.py (QLoRA finetuning of HOPE-augmented LLMs)
+# and scripts/train_eggroll.py (EGGROLL self-play RL center model).
+# These are NOT needed for the base image SSL pipeline (train_ssl.py).
+transformers>=4.44
+accelerate>=0.34
+peft>=0.12
+datasets>=2.20
+tokenizers>=0.19
+bitsandbytes>=0.43   # QLoRA 4-bit / 8-bit quantization (CUDA only)

@@ -39,7 +39,7 @@ class JEPAPredictor(nn.Module):
         self.d_model = d_model
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model,
-            dropout=dropout, batch_first=True, norm_first=True, activation="gelu",
+            dropout=dropout, batch_first=True, norm_first=False, activation="gelu",
         )
         self.predictor = nn.TransformerEncoder(layer, num_layers=depth)
         # Learned positional embedding so the predictor knows *which* positions

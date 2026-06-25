@@ -74,7 +74,7 @@ class SlotJEPAPredictor(nn.Module):
 
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model,
-            dropout=dropout, batch_first=True, norm_first=True, activation="gelu",
+            dropout=dropout, batch_first=True, norm_first=False, activation="gelu",
         )
         self.predictor = nn.TransformerEncoder(layer, num_layers=depth)
         self.pos_embed = nn.Parameter(torch.zeros(1, 1024, d_model))
