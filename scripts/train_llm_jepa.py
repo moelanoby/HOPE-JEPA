@@ -35,6 +35,12 @@ import os
 import sys
 from dataclasses import asdict
 
+# Defragment the CUDA caching allocator before any CUDA context is created.
+# QLoRA with gradient checkpointing fragments the 14-16 GiB budget heavily
+# (the OOM traceback typically shows multi-GB "reserved but unallocated");
+# expandable_segments lets freed blocks be returned across segment boundaries.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import yaml
 

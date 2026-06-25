@@ -34,14 +34,67 @@ from .reasoner import JepaReasoner
 from .surgery import build_hope_llm
 
 
+def _chunked_causal_lm_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    chunk_positions: int = 512,
+) -> torch.Tensor:
+    """Next-token CE that never materializes the full fp32 `[B, T, V]` tensor.
+
+    HF's built-in `ForCausalLMLoss` upcasts the whole `[B, T, V]` logits block
+    to float32 and runs `log_softmax` over the *entire* vocab in one call. For a
+    large-vocab model (Qwen2.5: V=152,064) at batch 4 x len 1024 that is a multi-
+    GB transient -- the classic "loss-function" CUDA OOM even when the model
+    weights themselves fit. This helper replicates HF's loss *exactly* (shift by
+    one, ignore_index=-100) but flattens to `[N, V]` and processes `chunk_positions`
+    rows at a time, so the fp32 peak is `chunk x V x 4` bytes instead of
+    `B*T*V*4`. Default 512 rows ~ 0.3 GiB per pass for Qwen2.5's vocab.
+
+    Args:
+        logits:          [B, T, V] from the HF model (the LM head already applied).
+        labels:          [B, T] (unshifted; we shift internally, matching HF).
+        ignore_index:    label value to skip (default -100 / pad).
+        chunk_positions: how many flattened positions to reduce per pass.
+    Returns:
+        scalar mean loss over non-ignored positions.
+    """
+    # Standard causal shift: predict token t+1 from position t.
+    shift_logits = logits[..., :-1, :].reshape(-1, logits.size(-1))   # [N, V]
+    shift_labels = labels[..., 1:].reshape(-1)                         # [N]
+    N = shift_labels.size(0)
+
+    total = shift_logits.new_zeros((), dtype=torch.float32)
+    count = shift_labels.new_zeros((), dtype=torch.float32)
+    for s in range(0, N, chunk_positions):
+        e = min(s + chunk_positions, N)
+        lg = shift_logits[s:e].float()                # [chunk, V] fp32, bounded
+        tgt = shift_labels[s:e]                       # [chunk]
+        loss = nn.functional.cross_entropy(lg, tgt, ignore_index=ignore_index,
+                                           reduction="sum")
+        n_valid = (tgt != ignore_index).sum()
+        total = total + loss
+        count = count + n_valid
+
+    if count.item() == 0:
+        return shift_logits.new_zeros(())
+    return total / count
+
+
 @dataclass
 class HopeOutput:
-    """Return type of `HopeLLM.forward`."""
+    """Return type of `HopeLLM.forward`.
+
+    Note: the HF model's vocab logits are intentionally NOT returned. With a
+    large-vocab LM head (Qwen2.5: V=152,064) the `[B, T, V]` tensor is multi-GB
+    and pinning it on the autograd graph through `.backward()` is a needless
+    OOM risk -- the loss already captures everything needed for training. Call
+    `model.model(...)` directly if you need logits at inference time.
+    """
     loss: torch.Tensor            # total (CE + aux)
     ce_loss: torch.Tensor         # next-token CE alone
     jepa_diag: dict               # slot-JEPA + SIGReg + div diagnostics
     reasoner_loss: torch.Tensor   # predict-ahead MSE (0 if reasoner off)
-    logits: torch.Tensor          # the HF model's vocab logits
 
 
 class HopeLLM(nn.Module):
@@ -94,17 +147,30 @@ class HopeLLM(nn.Module):
         do_reasoner = (use_reasoner if use_reasoner is not None
                        else self.reasoner is not None)
 
+        # Run the HF model WITHOUT labels: with a large-vocab LM head, HF's
+        # built-in ForCausalLMLoss upcasts the full [B, T, V] logits to fp32 and
+        # log-softmaxes them in one shot -- a multi-GB transient that OOMs even
+        # when the (quantized) weights fit. We pull logits + hidden states and
+        # compute CE ourselves via `_chunked_causal_lm_loss` (same value,
+        # bounded fp32 peak). Pass use_cache=False so hidden_states is complete.
         out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=labels,
+            labels=None,
             output_hidden_states=True,
             use_cache=False,
             return_dict=True,
         )
-        ce_loss = out.loss if out.loss is not None else input_ids.new_zeros(())
         logits = out.logits
         hidden_states = out.hidden_states    # tuple, len = num_layers + 1
+        if labels is not None:
+            ce_loss = _chunked_causal_lm_loss(logits, labels)
+        else:
+            ce_loss = input_ids.new_zeros(())
+        # Drop the logits reference so the full [B, T, V] tensor can be freed
+        # before backward -- keeping it on the graph is a needless OOM risk.
+        # `ce_loss` already pulled everything it needs out of it.
+        del logits
 
         # Slot-JEPA + SIGReg + slot-divergence on chosen hidden layers.
         jepa_loss, jepa_diag = self.jepa.compute_loss(
@@ -135,7 +201,7 @@ class HopeLLM(nn.Module):
         total = ce_loss + jepa_loss + reasoner_loss
         return HopeOutput(
             loss=total, ce_loss=ce_loss, jepa_diag=jepa_diag,
-            reasoner_loss=reasoner_loss, logits=logits,
+            reasoner_loss=reasoner_loss,
         )
 
     # ------------------------------------------------------------------
