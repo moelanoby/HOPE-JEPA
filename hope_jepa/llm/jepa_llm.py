@@ -144,9 +144,25 @@ class SlotJEPAForLLM(nn.Module):
                 if tpos.numel() > 0:
                     masked_states.append(z[i, tpos, :])
         sigreg_val = zero
+        flat = None
+        scale = None
         if self.cfg_sig.enabled and masked_states:
             flat = torch.cat(masked_states, dim=0)        # [n, h]
-            sigreg_val = self.sigreg(flat)
+            # A pretrained LLM's residual-stream hidden states carry a large,
+            # fixed magnitude (per-dim std ~ O(10-100)). SIGReg's
+            # ||Cov - sigma^2 I|| penalty assumes unit-scale embeddings; on raw
+            # hidden states it blows up to ~ magnitude^4 (a ~7M transient on a
+            # 3B model) and its gradient then crushes the representation toward
+            # unit variance -- fighting and damaging the pretrained weights (CE
+            # rebounds, effective rank collapses). SIGReg's actual job is to
+            # prevent collapse / enforce isotropy, i.e. the *shape* of the
+            # covariance, not its absolute scale. Normalize by the detached
+            # batch RMS so the penalty is scale-invariant: Cov(z/s) = Cov(z)/s^2
+            # shares the same (collapse-revealing) shape regardless of magnitude,
+            # and detaching `s` means the gradient only reshapes the covariance
+            # instead of shrinking the whole residual stream.
+            scale = flat.pow(2).mean().sqrt().clamp_min(1e-6).detach()
+            sigreg_val = self.sigreg(flat / scale)
 
         div_val = (slot_divergence_loss(self.slots)
                    if self.slot_div_weight > 0 else zero)
@@ -159,9 +175,11 @@ class SlotJEPAForLLM(nn.Module):
             n_total = sum(w.numel() for w in slot_weights)
             n_zeros = sum(int((w == 0).sum().item()) for w in slot_weights)
             slot_sparsity = (n_zeros / n_total) if n_total > 0 else 0.0
-            if self.cfg_sig.enabled and masked_states:
-                eff_rank = self.sigreg.effective_rank(
-                    torch.cat(masked_states, dim=0))
+            if flat is not None:
+                # Rank of the same normalized states SIGReg penalizes, so the
+                # diagnostic reflects the collapse signal the regularizer sees.
+                normed = flat / scale if scale is not None else flat
+                eff_rank = self.sigreg.effective_rank(normed)
             else:
                 eff_rank = -1.0
 
