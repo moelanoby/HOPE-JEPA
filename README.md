@@ -106,6 +106,46 @@ Smoke test (CPU, no download):
 python -m tests.test_llm_smoke
 ```
 
+#### Low-memory optimizers & throughput knobs
+
+`train_llm_jepa.py` ships three memory-efficient optimizers in addition to the
+standard AdamW family. These cut optimizer-state and gradient memory so you can
+fit a larger batch / sequence (the direct lever on steps/sec):
+
+```bash
+# LOMO -- fused SGD, GLOBAL grad clip. Two backward passes per step (a dry pass
+# to measure the global norm, then a live pass that applies the clipped update
+# and frees each grad as it is produced). No optimizer state at all.
+python scripts/train_llm_jepa.py ... --optimizer lomo --lr 1e-5
+
+# AdaLomo (RECOMMENDED) -- momentum + PER-TENSOR local clip, SINGLE backward pass.
+# The fastest fused variant; a good fit here because the Titans recurrence makes
+# a second backward expensive. Keeps one fp32 momentum buffer per param.
+python scripts/train_llm_jepa.py ... --optimizer adalomo --lr 2e-4
+
+# LISA -- Layerwise Importance Sampled AdamW. Activates only --lisa_k of the base
+# decoder layers per step (the rest are frozen: no state, no backward into them),
+# so optimizer state and backward compute drop by ~(num_layers / k).
+python scripts/train_llm_jepa.py ... --optimizer lisa --lisa_k 2 \
+    --lisa_refresh_every 50 --lr 2e-4
+```
+
+Throughput knobs (`--help` lists all):
+
+* `--prefetch N` (default 4) -- pre-tokenize batches on a CPU thread so the GPU
+  never waits on the tokenizer. `0` disables it.
+* `--diag_every N` (default 50) -- run the eff-rank SVD + sparsity diagnostic
+  only every N steps (it is log-only and forces a GPU sync otherwise).
+* `--max_len`, `--target_layers`, `--lisa_k` -- the biggest single-GPU levers on
+  steps/sec; lowering any of them proportionally reduces activation memory and
+  the cost of the HOPE/Titans recurrence.
+
+> **Note:** LOMO/AdaLomo fuse the update into backward, so they cannot be
+> combined with `--grad_accum > 1` (each backward already updates the params).
+> The JEPA compute path (mask sampling, slot-JEPA predictor, SIGReg gather) is
+> vectorized; `tests/test_optim_and_vectorize.py` is a torch-only gate proving
+> the vectorized losses/gradients match the old per-example code to ~1e-7.
+
 ---
 
 ## EGGROLL self-play RL (Phase 2: adversarial repo repair)
@@ -222,5 +262,7 @@ tests/
 - Assran et al., *Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture* (I-JEPA).
 - Balestriero & LeCun, *LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics*, arXiv:2511.08544 -- SIGReg.
 - Ma et al., *EGGROLL: Rank-r Black-Box Evolution Strategies for Large Language Models*, arXiv:2511.16652 -- EGGROLL optimizer.
+- Lv et al., *Full Parameter Fine-tuning for Large Language Models* (LOMO: LOw-Memory Optimization), OpenLMLab/LOMO -- fused update-into-backward.
+- Pan et al., *LISA: Layerwise Importance Sampling for Memory-Efficient Large Language Model Fine-Tuning*, arXiv:2403.17919 (NeurIPS 2024) -- LISA optimizer.
 - Garg et al., *What Makes or Breaks Policy Optimization?*, arXiv:2508.04349 -- GTPO / GRPO-S reward shaping.
 - facebookresearch/swe-rl -- SWE-RL edit-similarity + real test-suite reward.

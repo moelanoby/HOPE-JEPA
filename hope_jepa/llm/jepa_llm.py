@@ -89,6 +89,14 @@ class SlotJEPAForLLM(nn.Module):
                              cfg.sigreg.target_scale)
 
     # ------------------------------------------------------------------
+    # How often (in global steps) to run the expensive diagnostic SVD +
+    # per-slot sparsity loop. 1 = every step (legacy behaviour). The training
+    # script sets this higher (e.g. 50) to remove a per-step GPU sync + O(d^3)
+    # matmul that only feeds the log line. Off-steps reuse the last computed
+    # value (set lazily on the first `do_diag` step).
+    diag_every: int = 1
+    _last_eff_rank: float = -1.0
+    _last_slot_sparsity: float = 0.0
     def compute_loss(
         self,
         hidden_states: List[torch.Tensor],   # tuple from model(...,output_hidden_states=True)
@@ -135,19 +143,19 @@ class SlotJEPAForLLM(nn.Module):
 
         mean_jepa = torch.stack(jepa_losses).mean()
 
-        # SIGReg over the concatenated masked hidden states across chosen
-        # layers (regularizes every chosen layer's representation).
-        masked_states = []
-        for z in chosen:
-            for i in range(B):
-                tpos = torch.nonzero(mask[i], as_tuple=False).squeeze(-1)
-                if tpos.numel() > 0:
-                    masked_states.append(z[i, tpos, :])
+        # SIGReg over the masked hidden states across chosen layers (regularizes
+        # every chosen layer's representation). VECTORIZED: gather every masked
+        # position across (layer, batch) in one boolean-index op instead of the
+        # old per-example `nonzero`+gather loop (B*L kernel launches + syncs).
+        # chosen is a list of [B, T, h]; stack -> [L, B, T, h], then index with
+        # the broadcast mask [L, B, T] -> [n, h].
+        stacked = torch.stack(chosen, dim=0)                 # [L, B, T, h]
+        L = stacked.shape[0]
+        mask_broad = mask.unsqueeze(0).expand(L, B, T)        # [L, B, T]
+        flat = stacked[mask_broad]                            # [n, h]
         sigreg_val = zero
-        flat = None
         scale = None
-        if self.cfg_sig.enabled and masked_states:
-            flat = torch.cat(masked_states, dim=0)        # [n, h]
+        if self.cfg_sig.enabled and flat.numel() > 0:
             # A pretrained LLM's residual-stream hidden states carry a large,
             # fixed magnitude (per-dim std ~ O(10-100)). SIGReg's
             # ||Cov - sigma^2 I|| penalty assumes unit-scale embeddings; on raw
@@ -171,24 +179,47 @@ class SlotJEPAForLLM(nn.Module):
                  + (self.cfg_sig.weight * sigreg_val if self.cfg_sig.enabled else 0.0)
                  + self.slot_div_weight * div_val)
 
-        with torch.no_grad():
-            n_total = sum(w.numel() for w in slot_weights)
-            n_zeros = sum(int((w == 0).sum().item()) for w in slot_weights)
-            slot_sparsity = (n_zeros / n_total) if n_total > 0 else 0.0
-            if flat is not None:
-                # Rank of the same normalized states SIGReg penalizes, so the
-                # diagnostic reflects the collapse signal the regularizer sees.
-                normed = flat / scale if scale is not None else flat
-                eff_rank = self.sigreg.effective_rank(normed)
-            else:
-                eff_rank = -1.0
+        # Diagnostics: the effective_rank SVD (O(d^3) ~ 43 GFLOP for d=3584) and
+        # the per-slot sparsity loop force a GPU->CPU sync every step purely for
+        # the log line. On a single GPU that sync blocks the next step's launch.
+        # Compute them only every `diag_every` steps; on off-steps return cached /
+        # placeholder values. The scalar losses are still `.item()`-ed for the
+        # log, but those are single-element reductions (cheap vs. the SVD).
+        from .hope_block import get_global_step
+        gstep = get_global_step()
+        diag_every = getattr(self, "diag_every", 1)
+        do_diag = (diag_every <= 1) or (gstep % diag_every == 0)
 
+        with torch.no_grad():
+            if do_diag:
+                n_total = sum(w.numel() for w in slot_weights)
+                n_zeros = sum(int((w == 0).sum().item()) for w in slot_weights)
+                self._last_slot_sparsity = (n_zeros / n_total) if n_total > 0 else 0.0
+                if flat is not None:
+                    # Rank of the same normalized states SIGReg penalizes, so the
+                    # diagnostic reflects the collapse signal the regularizer sees.
+                    normed = flat / scale if scale is not None else flat
+                    self._last_eff_rank = self.sigreg.effective_rank(normed)
+                else:
+                    self._last_eff_rank = -1.0
+            slot_sparsity = getattr(self, "_last_slot_sparsity", 0.0)
+            eff_rank = getattr(self, "_last_eff_rank", -1.0)
+
+        # Coalesce the 4 scalar losses into ONE GPU->CPU transfer (was 4
+        # separate `.item()` calls = 4 syncs that each stall the next kernel
+        # launch). stack + .cpu() pulls them across in a single op.
+        _scalars = torch.stack([
+            mean_jepa.detach().reshape(()),
+            sigreg_val.detach().reshape(()),
+            div_val.detach().reshape(()),
+            total.detach().reshape(()),
+        ]).cpu()
         diag = {
-            "jepa": float(mean_jepa.detach().item()),
-            "sigreg": float(sigreg_val.detach().item()),
-            "slot_div": float(div_val.detach().item()),
+            "jepa": float(_scalars[0]),
+            "sigreg": float(_scalars[1]),
+            "slot_div": float(_scalars[2]),
             "slot_sparsity": float(slot_sparsity),
-            "total": float(total.detach().item()),
+            "total": float(_scalars[3]),
             "eff_rank": float(eff_rank),
         }
         return total, diag
@@ -203,14 +234,42 @@ def _masked_random_mask(B: int, T: int, mask_ratio: float,
     of them, and mark exactly those. At least 1 context and 1 target are kept
     whenever n_i >= 2; rows with <2 valid tokens get an all-False mask (those
     examples are skipped by `jepa_slot_layer_loss`).
+
+    VECTORIZED (was a per-example Python loop with B `randperm`+`nonzero`
+    launches, each a GPU sync). We instead assign every valid position a
+    uniform random score, sort each row's scores, and mark the n_mask lowest --
+    equivalent to sampling without replacement, but as a single batched
+    `topk`-per-row. n_mask is computed per row exactly as before:
+    ``max(1, min(n_i - 1, round(n_i * mask_ratio)))``.
     """
+    # n_i: number of valid positions per row, clamped so a valid row keeps
+    # >=2 positions (1 context, 1 target). Rows with <2 valid -> n_mask 0.
+    n_valid = valid.sum(dim=1)                            # [B]
+    n_mask = torch.zeros(B, dtype=torch.long, device=device)
+    enough = n_valid >= 2
+    if enough.any():
+        nv = n_valid.clamp_min(2)                          # only used where enough
+        nm = torch.round(nv.to(torch.float32) * mask_ratio).long()
+        nm = nm.clamp_min(1).clamp_max(nv - 1)
+        n_mask = torch.where(enough, nm, n_mask)
+
+    # Random scores over ALL positions; invalid positions are pushed to +inf so
+    # they are never picked by the (lowest-scores) selection.
+    scores = torch.rand(B, T, generator=generator, device=device)
+    scores = scores.masked_fill(~valid, float("inf"))
+
     mask = torch.zeros(B, T, dtype=torch.bool, device=device)
-    for i in range(B):
-        valid_idx = torch.nonzero(valid[i], as_tuple=False).squeeze(-1)
-        n_i = int(valid_idx.numel())
-        if n_i < 2:
-            continue
-        n_mask = max(1, min(n_i - 1, int(round(n_i * mask_ratio))))
-        perm = torch.randperm(n_i, generator=generator, device=device)[:n_mask]
-        mask[i, valid_idx[perm]] = True
+    max_k = int(n_mask.max().item())
+    if max_k >= 1:
+        # The k lowest scores per row. We take the global max_k then keep only
+        # the per-row n_mask of them, so each row gets exactly its own count.
+        _, top_idx = torch.topk(scores, max_k, dim=1, largest=False, sorted=True)
+        # top_idx: [B, max_k] (positions of the lowest-score columns per row).
+        row = torch.arange(B, device=device).unsqueeze(1)
+        mask[row, top_idx] = True
+        # Now zero out the columns beyond each row's own n_mask. Build a column
+        # mask [max_k] vs per-row count and apply it.
+        col = torch.arange(max_k, device=device).unsqueeze(0)        # [1, max_k]
+        keep = col < n_mask.unsqueeze(1)                             # [B, max_k]
+        mask[row, top_idx] = keep
     return mask

@@ -48,6 +48,10 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hope_jepa.llm import HopeLLM, HopeLlmConfig, set_global_step
+# Low-memory optimizers (LOMO/AdaLomo fuse their update into backward; LISA
+# activates only a subset of decoder layers per step). Imported at module scope
+# because the training loop isinstance-checks these types.
+from hope_jepa.optim import LOMO, AdaLomo
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +59,58 @@ def load_config(path: str) -> HopeLlmConfig:
     with open(path) as f:
         raw = yaml.safe_load(f)
     return HopeLlmConfig.from_dict(raw)
+
+
+class _NullCtx:
+    """A no-op context manager (used to disable AMP uniformly on CPU)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _split_lisa_params(model: HopeLLM):
+    """Group the model's trainable params for LISA.
+
+    Returns (always_active, layer_groups) where:
+      * always_active  -- the NEW wrapper modules (HOPE / slot-JEPA / Reasoner)
+        that must train EVERY step (they carry the new capabilities). These are
+        everything trainable that is NOT a base-decoder-layer LoRA adapter.
+      * layer_groups   -- one list of params PER base decoder layer, holding its
+        LoRA adapter params. LISA activates only K of these per step.
+
+    Grouping is by decoding the parameter NAME: peft LoRA params contain a
+    `.layers.<i>.` segment under the base model (e.g.
+    `base_model.model.model.layers.5.self_attn.q_proj.lora_A.default.weight`).
+    Everything else trainable (jepa.*, reasoner.*, HopeDecoderLayer params...)
+    is treated as always-on.
+    """
+    import re
+    always_active, layer_groups = [], {}
+    # Match the decoder layer index in a parameter path. The Llama-family base
+    # exposes layers as `model.layers.<i>`; peft nests these under
+    # `base_model.model.<...>`.
+    layer_re = re.compile(r"layers\.(\d+)\.")
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        m = layer_re.search(name)
+        if m:
+            layer_groups.setdefault(int(m.group(1)), []).append(p)
+        else:
+            always_active.append(p)
+
+    # Sort layer groups by index for determinism; drop any empty entries.
+    groups = [layer_groups[i] for i in sorted(layer_groups) if layer_groups[i]]
+    if not groups:
+        # No per-layer params found (e.g. placement with no base LoRA targets):
+        # fall back to treating everything as always-on so LISA still runs.
+        always_active = [p for p in model.parameters() if p.requires_grad]
+        groups = [[always_active.pop()]] if always_active else []
+    return always_active, groups
 
 
 def apply_qlora(model: HopeLLM, cfg: HopeLlmConfig):
@@ -231,6 +287,53 @@ def _encode_batch(tokenizer, texts, max_len, pad_id, device):
     return (input_ids.to(device), attn.to(device), labels.to(device))
 
 
+class PrefetchBatches:
+    """Pre-tokenize batches on a background CPU thread so the GPU never waits
+    on the tokenizer.
+
+    Wraps `iterate_batches`: a worker thread runs the (CPU-bound) text scan +
+    tokenize loop and pushes finished batches onto a bounded queue. The main
+    (GPU) thread pulls batches off the queue, so tokenization overlaps with the
+    forward/backward compute. All `.to(device)` H2D copies happen on the worker
+    thread here -- they are cheap relative to tokenize and keep the main thread
+    purely on GPU work. The default `queue.maxsize=prefetch` bounds memory.
+
+    On any worker exception the error is re-raised on the main thread at the
+    next `next()` call (so failures are not silently swallowed). With
+    `prefetch=0` the caller should use `iterate_batches` directly (synchronous).
+    """
+
+    def __init__(self, iterator_factory, prefetch: int, device):
+        from queue import Queue
+        from threading import Thread
+        self._device = device
+        self._sentinel = object()
+        self._q: Queue = Queue(maxsize=max(1, prefetch))
+        self._exc: list = []
+        self._thread = Thread(target=self._run, args=(iterator_factory,), daemon=True)
+        self._thread.start()
+
+    def _run(self, iterator_factory):
+        try:
+            for batch in iterator_factory():
+                self._q.put(batch)
+        except BaseException as e:  # surface on the main thread
+            self._exc.append(e)
+        finally:
+            self._q.put(self._sentinel)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._q.get()
+        if item is self._sentinel:
+            if self._exc:
+                raise self._exc[0]
+            raise StopIteration
+        return item
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/llm_default.yaml")
@@ -249,8 +352,14 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=1,
                     help="Number of gradient accumulation steps (default: 1)")
     ap.add_argument("--optimizer", default="adamw",
-                    choices=["adamw", "adamw_8bit", "paged_adamw_8bit", "paged_adamw_32bit"],
-                    help="Optimizer type to use (default: adamw)")
+                    choices=["adamw", "adamw_8bit", "paged_adamw_8bit", "paged_adamw_32bit",
+                             "lomo", "adalomo", "lisa"],
+                    help="Optimizer: adamw (default) | 8-bit/paged bnb variants | "
+                         "lomo (fused SGD, global clip, 2 backward passes) | "
+                         "adalomo (fused momentum, per-tensor clip, 1 pass -- "
+                         "recommended low-memory) | "
+                         "lisa (Layerwise Importance Sampled AdamW: activate only "
+                         "--lisa_k decoder layers per step).")
     ap.add_argument("--max_len", type=int, default=1024)
     ap.add_argument("--max_steps", type=int, default=0,
                     help="cap on total steps (0 = no cap)")
@@ -258,6 +367,33 @@ def main():
                     help="Enable gradient checkpointing (default: True)")
     ap.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing",
                     help="Disable gradient checkpointing")
+    # --- Single-GPU speedups -------------------------------------------------
+    ap.add_argument("--amp", action="store_true", default=True,
+                    help="bf16 autocast for the custom (HOPE/JEPA/SIGReg/CE) compute "
+                         "(default: True; the 4-bit base already runs low-precision, "
+                         "but the added heads run fp32 without this). Auto-disabled on CPU.")
+    ap.add_argument("--no_amp", action="store_false", dest="amp",
+                    help="Disable bf16 autocast (run custom compute in fp32)")
+    ap.add_argument("--compile", action="store_true", default=False,
+                    help="torch.compile the model (default: OFF). Experimental with "
+                         "4-bit QLoRA + the Titans recurrence; falls back to eager if "
+                    "graph capture fails. Enable only if you have time to debug.")
+    ap.add_argument("--prefetch", type=int, default=4,
+                    help="Number of batches to pre-tokenize on a CPU thread so the GPU "
+                         "is not starved by the tokenizer (0 = disable; default: 4)")
+    ap.add_argument("--diag_every", type=int, default=50,
+                    help="Only run the expensive eff_rank SVD + sparsity diagnostic "
+                         "every N optimizer steps (default: 50). It feeds only the log "
+                         "line but costs an O(d^3) matmul + GPU sync each step.")
+    # --- LISA (Layerwise Importance Sampled AdamW) knobs ----------------------
+    ap.add_argument("--lisa_k", type=int, default=2,
+                    help="LISA: number of base decoder layers activated per step "
+                         "(the rest are frozen, so backward is pruned into them). "
+                         "Only used with --optimizer lisa. Paper default: 2.")
+    ap.add_argument("--lisa_refresh_every", type=int, default=50,
+                    help="LISA: re-rank layers by accumulated grad-norm and rebuild "
+                         "the sampling distribution every N steps (default: 50). "
+                         "Only used with --optimizer lisa.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -265,7 +401,10 @@ def main():
     # --- Model ---
     model = HopeLLM(cfg)                       # loads + splices HOPE layers
     model = apply_qlora(model, cfg)            # 4-bit QLoRA on base, new params trainable
-    
+    # Throttle the per-step eff_rank SVD + sparsity diagnostic. It feeds only
+    # the log line but costs an O(d^3) matmul + GPU sync every step otherwise.
+    model.jepa.diag_every = max(1, args.diag_every)
+
     if args.gradient_checkpointing:
         # Try to pass gradient_checkpointing_kwargs to avoid the PyTorch 2.9 warning
         try:
@@ -280,6 +419,28 @@ def main():
     model.to(device)
     model.train()
 
+    # --- Mixed precision -----------------------------------------------------
+    # The 4-bit base already runs low-precision, but the spliced HOPE/Titans,
+    # slot-JEPA, SIGReg and chunked-CE compute all run fp32 unless wrapped.
+    # bf16 autocast engages the T4 tensor cores for those ops (~1.5-2x) with no
+    # accuracy caveat: CE cross-entropy and SIGReg covariance already upcast to
+    # fp32 inside their kernels. Auto-disabled on CPU (no benefit / no bf16 path).
+    use_amp = args.amp and device == "cuda"
+    amp_ctx = (torch.autocast("cuda", dtype=torch.bfloat16) if use_amp
+               else _NullCtx())
+
+    # --- Optional torch.compile (experimental) --------------------------------
+    # The Titans recurrence is a long Python loop and 4-bit QLoRA has known
+    # compile-compatibility quirks, so this is OFF by default and falls back to
+    # eager if graph capture throws.
+    if args.compile and device == "cuda":
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[compile] torch.compile enabled (mode=reduce-overhead)", flush=True)
+        except Exception as e:  # pragma: no cover - environment dependent
+            print(f"[compile] torch.compile unavailable, falling back to eager: {e}",
+                  flush=True)
+
     # --- Data ---
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
@@ -291,8 +452,52 @@ def main():
         else load_dataset("json", data_files=args.dataset, split="train")
 
     # --- Optimizer (LoRA + new params) ---
+    # `trainable` is the always-on trainable set (LoRA adapters + the new
+    # HOPE/JEPA/Reasoner wrapper modules). For AdamW-family optimizers this is
+    # the full param list; for LISA it is split into (always-on wrapper params)
+    # + (per-decoder-layer LoRA groups) so only K layers activate per step.
     trainable = [p for p in model.parameters() if p.requires_grad]
-    if args.optimizer == "adamw":
+
+    # Detect whether the optimizer fuses its update into backward (LOMO/AdaLomo).
+    # If so, gradient clipping / zero_grad are handled inside the fused hooks and
+    # must NOT be called explicitly (they'd double-update or error). Fused
+    # optimizers update params IN PLACE during backward, so they are INCOMPATIBLE
+    # with gradient accumulation (you cannot accumulate grads across micro-batches
+    # when each backward already applied its update).
+    fused_opt = args.optimizer in ("lomo", "adalomo")
+    if fused_opt and args.grad_accum > 1:
+        raise SystemExit(
+            f"--optimizer {args.optimizer} fuses the update into backward and so "
+            f"cannot be combined with --grad_accum > 1 (each backward already "
+            f"updates the params). Use --grad_accum 1, or pick a non-fused "
+            f"optimizer (adamw / paged_adamw_8bit / lisa).")
+    lisa_opt = args.optimizer == "lisa"
+    opt = None
+    lisa = None   # the LISA optimizer (for per-step layer sampling) if lisa_opt
+
+    if lisa_opt:
+        from hope_jepa.optim import LISA
+        always_active, layer_groups = _split_lisa_params(model)
+        # `trainable` for LISA = always-on params only (the layer groups are
+        # toggled per step and must not be in the "always" clip set).
+        trainable = always_active
+        lisa = LISA(
+            always_active_params=always_active,
+            layer_groups=layer_groups,
+            lr=cfg.training.lr,
+            k=min(args.lisa_k, len(layer_groups)),
+            refresh_every=args.lisa_refresh_every,
+            weight_decay=0.0,
+        )
+        # Mark the LoRA adapter params as LISA-toggleable (frozen base stays off).
+        lora_params = [p for g in layer_groups for p in g]
+        lisa.mark_trainable(lora_params)
+        opt = lisa
+    elif args.optimizer == "lomo":
+        opt = LOMO(trainable, lr=cfg.training.lr, clip_grad=1.0)
+    elif args.optimizer == "adalomo":
+        opt = AdaLomo(trainable, lr=cfg.training.lr, momentum=0.9, clip_grad=1.0)
+    elif args.optimizer == "adamw":
         opt = torch.optim.AdamW(trainable, lr=cfg.training.lr, weight_decay=0.0)
     elif args.optimizer == "adamw_8bit":
         import bitsandbytes as bnb
@@ -306,57 +511,104 @@ def main():
     else:
         raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
+    # Before the first step, LISA must freeze its inactive layers so the first
+    # forward prunes backward into them.
+    if lisa is not None:
+        lisa.sample_layers(step)
+
     os.makedirs(args.output, exist_ok=True)
     step = 0
     accum_steps = args.grad_accum
     opt.zero_grad()
-    
+
+    # --- Batch iterator: prefetch on a CPU thread if requested, else sync. ----
+    # `--prefetch` (default 4) keeps the GPU fed while the tokenizer runs. The
+    # worker builds batches; the GPU thread consumes them. prefetch=0 -> the old
+    # synchronous `iterate_batches` (no thread overhead).
+    def _make_iter():
+        return iterate_batches(
+            tokenizer, ds, args.max_len, args.batch_size, device,
+            text_column=args.text_column, json_field=args.json_field,
+        )
+
+    if args.prefetch and args.prefetch > 0:
+        batch_iter = PrefetchBatches(_make_iter, args.prefetch, device)
+    else:
+        batch_iter = _make_iter()
+
+    def _log(epoch, s, out, suffix=""):
+        """One coalesced log line. `out.ce_loss` / `out.loss` are pulled to CPU
+        in a single stack so we issue at most one GPU->CPU sync for the scalars
+        that weren't already `.item()`-ed inside the diag dict."""
+        d = out.jepa_diag
+        scalars = torch.stack([
+            out.loss.detach().reshape(()),
+            out.ce_loss.detach().reshape(()),
+        ]).cpu()
+        print(f"[ep{epoch} s{s}] loss={float(scalars[0]):.4f} "
+              f"ce={float(scalars[1]):.4f} jepa={d['jepa']:.4f} "
+              f"sigreg={d['sigreg']:.4f} div={d['slot_div']:.4f} "
+              f"sparse={d['slot_sparsity']:.3f} effrank={d['eff_rank']:.1f}"
+              f"{suffix}", flush=True)
+
     for epoch in range(args.epochs):
         batch_idx = 0
         out = None
-        for input_ids, attn_mask, labels in iterate_batches(
-                tokenizer, ds, args.max_len, args.batch_size, device,
-                text_column=args.text_column,
-                json_field=args.json_field):
+        for input_ids, attn_mask, labels in batch_iter:
+            # LISA: pick this step's active layers BEFORE forward so backward is
+            # pruned into frozen layers. Skip on accumulation sub-steps (the
+            # active set is fixed for the whole accumulated step).
+            if lisa is not None and batch_idx % accum_steps == 0:
+                lisa.sample_layers(step)
+
             set_global_step(model, step)
-            
-            out = model(input_ids=input_ids, attention_mask=attn_mask,
-                        labels=labels)
-            
+
+            with amp_ctx:
+                out = model(input_ids=input_ids, attention_mask=attn_mask,
+                            labels=labels)
+
             loss = out.loss / accum_steps
-            loss.backward()
-            
+            if fused_opt and isinstance(opt, AdaLomo):
+                # AdaLomo: single backward applies the fused update.
+                loss.backward()
+            elif fused_opt and isinstance(opt, LOMO):
+                # LOMO needs the GLOBAL grad norm, which is only known after
+                # backward -- but the update must happen DURING backward. So:
+                # (1) a DRY backward (retain_graph=True so the graph survives)
+                #     whose hooks only accumulate the global norm; then
+                # (2) zero grads, arm the live hooks, and a LIVE backward that
+                #     clips each grad by the measured norm and applies the SGD
+                #     step in place, freeing each grad as it goes.
+                opt.zero_grad()
+                loss.backward(retain_graph=True)   # dry: hooks only measure norm
+                opt.begin_fused_update()           # finalize norm, arm live hooks
+                loss.backward()                    # live: hooks apply + free grads
+            else:
+                loss.backward()
+
             batch_idx += 1
             if batch_idx % accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                if not fused_opt:
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 opt.step()
-                opt.zero_grad()
+                if not fused_opt:
+                    opt.zero_grad()
                 step += 1
-                
-                d = out.jepa_diag
-                print(f"[ep{epoch} s{step}] loss={out.loss.item():.4f} "
-                      f"ce={out.ce_loss.item():.4f} jepa={d['jepa']:.4f} "
-                      f"sigreg={d['sigreg']:.4f} div={d['slot_div']:.4f} "
-                      f"sparse={d['slot_sparsity']:.3f} effrank={d['eff_rank']:.1f}",
-                      flush=True)
-            
+                _log(epoch, step, out)
+
             if args.max_steps and step >= args.max_steps:
                 break
-                
+
         # End of epoch: step remaining gradients
         if batch_idx % accum_steps != 0 and out is not None:
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            if not fused_opt:
+                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
-            opt.zero_grad()
+            if not fused_opt:
+                opt.zero_grad()
             step += 1
-            
-            d = out.jepa_diag
-            print(f"[ep{epoch} s{step}] loss={out.loss.item():.4f} "
-                  f"ce={out.ce_loss.item():.4f} jepa={d['jepa']:.4f} "
-                  f"sigreg={d['sigreg']:.4f} div={d['slot_div']:.4f} "
-                  f"sparse={d['slot_sparsity']:.3f} effrank={d['eff_rank']:.1f} (epoch end)",
-                  flush=True)
-                  
+            _log(epoch, step, out, suffix=" (epoch end)")
+
         if args.max_steps and step >= args.max_steps:
             break
 
