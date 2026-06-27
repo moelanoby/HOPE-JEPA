@@ -513,13 +513,12 @@ def main():
 
     # Before the first step, LISA must freeze its inactive layers so the first
     # forward prunes backward into them.
-    if lisa is not None:
-        lisa.sample_layers(step)
-
     os.makedirs(args.output, exist_ok=True)
     step = 0
     accum_steps = args.grad_accum
     opt.zero_grad()
+    if lisa is not None:
+        lisa.sample_layers(step)
 
     # --- Batch iterator: prefetch on a CPU thread if requested, else sync. ----
     # `--prefetch` (default 4) keeps the GPU fed while the tokenizer runs. The
