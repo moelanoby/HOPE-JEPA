@@ -30,6 +30,8 @@ encoder gathers and recombines.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,7 +106,9 @@ class SlotJEPAPredictor(nn.Module):
         self.raw_inv_temp = nn.Parameter(torch.tensor(2.0))    # softplus -> ~2.4, sparse init
 
     def forward(self, z_context: torch.Tensor, context_pos: torch.Tensor,
-                target_pos: torch.Tensor, slots: torch.Tensor
+                target_pos: torch.Tensor, slots: torch.Tensor,
+                ctx_key_padding_mask: Optional[torch.Tensor] = None,
+                tgt_key_padding_mask: Optional[torch.Tensor] = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict target embeddings via K slots, sparse-mixed.
 
@@ -114,6 +118,13 @@ class SlotJEPAPredictor(nn.Module):
                         with the non-slot predictor / future position features).
             target_pos: [B, Nt]     position indices to predict.
             slots:      [K, d]      shared slot embeddings (mix keys).
+            ctx_key_padding_mask: [B, Nc] bool, True = PAD context position
+                        (ignored by the encoder). None when there is no padding
+                        (the per-example call path).
+            tgt_key_padding_mask: [B, Nt] bool, True = PAD target position. Padded
+                        target outputs are unused by the caller (their MSE is
+                        masked out); we still zero their slot-mix weights so they
+                        don't contaminate the sparsity diagnostic.
         Returns:
             preds:   [B, Nt, d]   sparse slot-mixed predictions.
             weights: [B, Nt, K]   entmax weights used per target (sum to 1 over
@@ -125,8 +136,40 @@ class SlotJEPAPredictor(nn.Module):
 
         mask_tok = self.mask_token.expand(B, Nt, -1)
         seq = torch.cat([z_context, mask_tok], dim=1)         # [B, Nc+Nt, d]
-        seq = seq + self.pos_embed[:, : seq.shape[1]]
-        out = self.predictor(seq)
+        # Per-example positional embedding, EXACTLY matching the per-example path:
+        # context token j -> position j, target token t -> position Nc_i + t.
+        # The shared layout (`pos_embed[:, :Nc+Nt]`, where Nc is the batch MAX)
+        # would place every example's targets at position Nc_max instead of its
+        # own Nc_i -- a numerical drift. We index `pos_embed` per row with a
+        # [B, Nc+Nt] position map instead. Padded positions are clamped to 0 and
+        # masked out below, so their (bogus) embedding never affects valid rows.
+        cols = torch.arange(Nc + Nt, device=seq.device).unsqueeze(0)   # [1, Nc+Nt]
+        if tgt_key_padding_mask is not None:
+            # n_ctx per row tells where the example's targets start.
+            n_ctx = (~ctx_key_padding_mask).sum(dim=1) if ctx_key_padding_mask is not None \
+                else torch.full((B,), Nc, device=seq.device, dtype=torch.long)
+            pos = torch.where(
+                cols < Nc, cols,
+                cols - Nc + n_ctx.unsqueeze(1),                        # [B, Nc+Nt]
+            )
+        else:
+            pos = cols.expand(B, -1).contiguous()
+        pos = pos.clamp_max(self.pos_embed.shape[1] - 1)
+        seq = seq + self.pos_embed[0, pos]                              # [B, Nc+Nt, d]
+        # Combine context/target padding into one [B, Nc+Nt] mask for the
+        # encoder (True = padding, to be ignored by attention). Target positions
+        # are never padding in the attention sense -- they carry the mask token
+        # we want to predict -- so only context padding propagates here. We pass
+        # the combined mask so padded context tokens don't leak into predictions.
+        if ctx_key_padding_mask is not None:
+            kp_mask = torch.cat([
+                ctx_key_padding_mask,
+                tgt_key_padding_mask if tgt_key_padding_mask is not None
+                else torch.zeros(B, Nt, dtype=torch.bool, device=seq.device),
+            ], dim=1)
+        else:
+            kp_mask = None
+        out = self.predictor(seq, src_key_padding_mask=kp_mask)
         c = out[:, Nc:]                                       # [B, Nt, d] per-target summary
 
         # Per-slot predictions, accumulated into the mix lazily to avoid forming
@@ -149,6 +192,11 @@ class SlotJEPAPredictor(nn.Module):
         for k in range(K):
             w_k = weights[:, :, k].unsqueeze(-1)              # [B, Nt, 1]
             preds = preds + w_k * slot_preds[k]
+        # Zero out padded-target rows so they can't leak into the caller's MSE
+        # / sparsity stats (they are masked out anyway, but this is belt-and-
+        # braces and free).
+        if tgt_key_padding_mask is not None:
+            preds = preds.masked_fill(tgt_key_padding_mask.unsqueeze(-1), 0.0)
         return preds, weights
 
 
@@ -157,47 +205,84 @@ def jepa_slot_layer_loss(z: torch.Tensor, mask: torch.Tensor,
                              ) -> tuple[torch.Tensor, torch.Tensor]:
     """Slot-JEPA prediction loss for a single layer (MSE) + the mixing weights.
 
-    Mirrors `jepa_layer_loss` (per-example Python loop over the batch, since
-    masks are variable-length and N is small).
+    VECTORIZED over the batch (was a per-example Python loop launching B
+    separate predictor forwards -- with B=4 and 3 chosen layers that was 12
+    small transformer-encoder kernel launches + syncs per step). We pad
+    context/target token counts to the per-batch maxima and mask the padded
+    positions out, so ONE batched predictor forward replaces B forwards. The
+    MSE is computed only over the REAL (non-padded) target positions,
+    reproducing the per-example result exactly: a mean of squared errors over
+    all real targets, which equals concatenating every example's real targets
+    and taking F.mse_loss (the old behaviour).
 
     Returns:
-        (mse_loss, weights) where weights is the full per-target entmax weight
-        tensor [n_examples, Nt, K] across the layer (before any averaging), so
-        the caller can compute the genuine zero-fraction sparsity. Entries are
-        exactly 0 wherever entmax dropped a slot for a target.
+        (mse_loss, weights) where weights is the per-target entmax weight
+        tensor [n_real_targets, K] across the layer (the real, non-padded
+        target rows only), so the caller can compute the genuine zero-fraction
+        sparsity. Entries are exactly 0 wherever entmax dropped a slot for a
+        target. Rows for examples with too few tokens are skipped.
     """
     B, N, d = z.shape
-    preds_list, targets_list, weights_list = [], [], []
-    for i in range(B):
-        m = mask[i]
-        tpos = torch.nonzero(m, as_tuple=False).squeeze(-1)
-        cpos = torch.nonzero(~m, as_tuple=False).squeeze(-1)
-        if tpos.numel() == 0 or cpos.numel() == 0:
-            continue
-        cpos_b = cpos.unsqueeze(0)
-        tpos_b = tpos.unsqueeze(0)
-        zc = z[i:i + 1, cpos, :]
-        pred, w = predictor(zc, cpos_b, tpos_b, slots)        # [1, Nt, d], [1, Nt, K]
-        tgt = z[i:i + 1, tpos, :]
-        preds_list.append(pred)
-        targets_list.append(tgt)
-        weights_list.append(w)
+    is_target = mask                                    # [B, N] bool, True=target
+    is_context = ~mask                                 # [B, N] bool
 
-    if not preds_list:
+    n_ctx = is_context.sum(dim=1)                       # [B]
+    n_tgt = is_target.sum(dim=1)                        # [B]
+    usable = (n_ctx >= 1) & (n_tgt >= 1)               # rows that contribute
+
+    if not usable.any():
         zero = z.new_zeros(())
-        empty_w = z.new_zeros(0, 0, predictor.num_slots)
+        empty_w = z.new_zeros(0, predictor.num_slots)
         return zero, empty_w
-    shapes = [p.shape for p in preds_list]
-    if all(s == shapes[0] for s in shapes):
-        preds = torch.cat(preds_list, dim=0)
-        targets = torch.cat(targets_list, dim=0)
-        weights = torch.cat(weights_list, dim=0)
-    else:
-        preds = torch.cat([p.view(-1, d) for p in preds_list], dim=0)
-        targets = torch.cat([t.view(-1, d) for t in targets_list], dim=0)
-        weights = torch.cat([w.view(-1, predictor.num_slots) for w in weights_list], dim=0).unsqueeze(0)
-    loss = F.mse_loss(preds, targets)
-    return loss, weights
+
+    Nc_max = int(n_ctx.max().item())
+    Nt_max = int(n_tgt.max().item())
+
+    # Dense [B, Nc_max] / [B, Nt_max] index maps of the context / target
+    # positions per row (trailing slots padded with index 0 and masked below).
+    # Built with one cheap Python loop over B (index arithmetic only -- no GPU
+    # kernel launch per example, unlike the old per-example predictor call).
+    ctx_idx = torch.zeros(B, Nc_max, dtype=torch.long, device=z.device)
+    tgt_idx = torch.zeros(B, Nt_max, dtype=torch.long, device=z.device)
+    for i in range(B):
+        ci = torch.nonzero(is_context[i], as_tuple=False).squeeze(-1)
+        ti = torch.nonzero(is_target[i], as_tuple=False).squeeze(-1)
+        if ci.numel() > 0:
+            ctx_idx[i, :ci.numel()] = ci
+        if ti.numel() > 0:
+            tgt_idx[i, :ti.numel()] = ti
+
+    rows = torch.arange(B, device=z.device).unsqueeze(1)
+    zc = z[rows, ctx_idx]                               # [B, Nc_max, d]
+    zt = z[rows, tgt_idx]                               # [B, Nt_max, d]
+
+    cols_c = torch.arange(Nc_max, device=z.device).unsqueeze(0)
+    ctx_pad = cols_c >= n_ctx.unsqueeze(1)             # [B, Nc_max]
+    cols_t = torch.arange(Nt_max, device=z.device).unsqueeze(0)
+    tgt_pad = cols_t >= n_tgt.unsqueeze(1)             # [B, Nt_max]
+
+    # ONE batched predictor forward over the padded [context | mask-token]
+    # sequences. src_key_padding_mask tells the encoder which positions are
+    # padding, so valid outputs are unaffected by the padding.
+    preds, weights = predictor(
+        zc, context_pos=ctx_idx, target_pos=tgt_idx, slots=slots,
+        ctx_key_padding_mask=ctx_pad, tgt_key_padding_mask=tgt_pad,
+    )                                                   # [B,Nt_max,d], [B,Nt_max,K]
+
+    # MSE only over REAL target positions. F.mse_loss (mean reduction) divides
+    # by the number of ELEMENTS, i.e. n_real_targets * d. We summed sq_err over
+    # the d axis already, so we divide by (n_real_targets * d) to match exactly.
+    sq_err = (preds - zt).pow(2).sum(dim=-1)           # [B, Nt_max]
+    real_t = (~tgt_pad).to(sq_err.dtype)               # [B, Nt_max]
+    loss = (sq_err * real_t).sum() / (real_t.sum().clamp_min(1.0) * d)
+
+    # Flatten the REAL target rows of `weights` for the sparsity diagnostic.
+    usable_rows = usable.nonzero(as_tuple=False).squeeze(-1).tolist()
+    valid_cols = ~tgt_pad
+    w_list = [weights[b][valid_cols[b]] for b in usable_rows]
+    weights_flat = (torch.cat(w_list, dim=0) if w_list
+                    else z.new_zeros(0, predictor.num_slots))
+    return loss, weights_flat.detach()
 
 
 # ---------------------------------------------------------------------------
