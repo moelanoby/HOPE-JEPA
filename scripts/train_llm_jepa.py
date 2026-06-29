@@ -189,16 +189,26 @@ def _extract_text(ex: dict, text_column: str | None,
 
     col = text_column
     if col is None or col not in ex:
-        # auto-pick: prefer an explicit text column, else row_json.
-        for cand in ("text", "row_json", "content", "prompt", "completion"):
+        # auto-pick: prefer an explicit text column, else a chat column.
+        for cand in ("text", "conversations", "messages", "row_json",
+                     "content", "prompt", "completion"):
             if cand in ex:
                 col = cand
                 break
     if col is None or col not in ex:
         return ""
     val = ex[col]
+
+    # --- Chat-format datasets (sharegpt/openassistant style): a list of turns
+    # like [{"from":"human","value":"..."},{"from":"gpt","value":"..."}] or
+    # [{"role":"user","content":"..."},...]. Flatten to a single string we can
+    # train the LM on. This is the most common reason rows were silently
+    # skipped before (no text/content/completion column exists). ---
+    if isinstance(val, list) and val and isinstance(val[0], dict):
+        return _flatten_turns(val)
+
     if not isinstance(val, str):
-        # Some datasets store lists/dicts natively (not as a json string).
+        # Some datasets store dicts natively (not as a json string).
         if isinstance(val, (list, dict)):
             val = _json.dumps(val)
         else:
@@ -238,6 +248,43 @@ def _dig_field(obj, field: str):
         else:
             return None
     return cur
+
+
+def _flatten_turns(turns) -> str:
+    """Flatten a list of chat turns into a single training string.
+
+    Handles the two common schemas:
+      * sharegpt:  [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]
+      * openai:    [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+
+    The role/value keys are tried in order. Turns with empty text are dropped.
+    We join with newlines so the model sees one contiguous sequence.
+    """
+    parts = []
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        # Role: "from" (sharegpt) or "role" (openai).
+        role = t.get("from") or t.get("role") or ""
+        # Text: "value" (sharegpt) or "content" (openai).
+        text = t.get("value")
+        if text is None:
+            text = t.get("content")
+        if text is None:
+            # message.content nested style.
+            msg = t.get("message")
+            if isinstance(msg, dict):
+                text = msg.get("content")
+        if isinstance(text, list):
+            # content can itself be a list of {text: ...} blocks.
+            text = "\n".join(
+                (b.get("text") if isinstance(b, dict) else str(b)) or ""
+                for b in text
+            )
+        if not isinstance(text, str) or not text.strip():
+            continue
+        parts.append(f"{role}: {text}" if role else text)
+    return "\n".join(parts).strip()
 
 
 def iterate_batches(tokenizer, dataset, max_len: int, batch_size: int, device,
@@ -611,7 +658,38 @@ def main():
         if args.max_steps and step >= args.max_steps:
             break
 
+    # Safety net: if NO optimizer steps ran, the dataset yielded nothing usable.
+    # This is almost always a text-column/schema mismatch (e.g. a sharegpt
+    # `conversations` dataset with no `text`/`content` column). Fail loudly
+    # instead of silently saving an untrained checkpoint.
+    if step == 0:
+        print("\n" + "!" * 72, flush=True)
+        print("ERROR: 0 optimizer steps ran -- the model was NOT trained, so", flush=True)
+        print("nothing useful was saved. The dataset yielded no usable batches.", flush=True)
+        print("!" * 72, flush=True)
+        print("Likely cause: the rows don't have a text column the loader "
+              "recognizes.\n", flush=True)
+        # Peek at the first row to show the user what schema it actually has.
+        try:
+            sample = next(iter(ds))
+            print(f"First row keys: {list(sample.keys())}", flush=True)
+            for k, v in sample.items():
+                vt = type(v).__name__
+                prev = (str(v)[:120] + "...") if isinstance(v, str) else \
+                       (f"<{vt} of len {len(v)}>" if isinstance(v, (list, dict)) else str(v))
+                print(f"  {k} ({vt}): {prev}", flush=True)
+            print("\nFix: pass the right --text_column, e.g.", flush=True)
+            print("  --text_column conversations   # sharegpt chat format", flush=True)
+            print("  --text_column text            # plain-text column", flush=True)
+            print("or --json_field for a nested field inside a JSON-string column.",
+                  flush=True)
+        except Exception as e:
+            print(f"(could not peek at dataset: {e})", flush=True)
+        print("\n" + "!" * 72, flush=True)
+        return
+
     # Save adapters + the new (non-quantized) HOPE/JEPA modules.
+    print(f"\nTrained {step} optimizer step(s).", flush=True)
     model.model.save_pretrained(args.output)
     tokenizer.save_pretrained(args.output)
     print(f"Saved to {args.output}")
