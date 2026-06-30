@@ -76,18 +76,25 @@ class SIGReg(nn.Module):
         eff_rank = exp(H(p)),  p_i = sv_i / sum(sv_i).  High (~d) = healthy,
         ~1 = collapsed. Computed on the full (un-sketched) covariance for an
         honest collapse signal; cheap because d is modest.
+
+        Runs in float32: the SVD has no CUDA kernel for bf16 (would raise
+        NotImplementedError under bf16 autocast), and a covariance SVD wants full
+        precision anyway. This is a log-only diagnostic, never on the autograd
+        graph, so the upcast is free.
         """
-        z = z.reshape(-1, self.d_model)
+        z = z.reshape(-1, self.d_model).float()
         if not torch.isfinite(z).all():
             return -1.0
         zc = z - z.mean(dim=0, keepdim=True)
         cov = (zc.t() @ zc) / max(zc.shape[0] - 1, 1)
         if not torch.isfinite(cov).all():
             return -1.0
-        # singular values of the PSD covariance == eigenvalues.
+        # singular values of the PSD covariance == eigenvalues. Catch broadly:
+        # svdvals can raise LinAlgError (singular) OR NotImplementedError /
+        # RuntimeError when no kernel exists for the tensor's dtype/device.
         try:
             sv = torch.linalg.svdvals(cov)
-        except torch._C._LinAlgError:
+        except (torch._C._LinAlgError, NotImplementedError, RuntimeError):
             return -1.0
         sv = sv.clamp_min(1e-12)
         p = sv / sv.sum()
