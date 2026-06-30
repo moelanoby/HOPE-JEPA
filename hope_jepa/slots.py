@@ -254,7 +254,13 @@ def jepa_slot_layer_loss(z: torch.Tensor, mask: torch.Tensor,
 
     rows = torch.arange(B, device=z.device).unsqueeze(1)
     zc = z[rows, ctx_idx]                               # [B, Nc_max, d]
-    zt = z[rows, tgt_idx]                               # [B, Nt_max, d]
+    # STOP-GRADIENT the JEPA targets. This is standard JEPA practice (predict
+    # detached targets) AND a major memory win: without it, the MSE loss keeps a
+    # backward path through the (full-sequence) HF hidden states -- the largest
+    # activation tensor on the graph, since the wrapper passes
+    # output_hidden_states=True for JEPA. Detaching severs that path, so the
+    # hidden states for target positions don't have to be retained for backward.
+    zt = z[rows, tgt_idx].detach()                      # [B, Nt_max, d]
 
     cols_c = torch.arange(Nc_max, device=z.device).unsqueeze(0)
     ctx_pad = cols_c >= n_ctx.unsqueeze(1)             # [B, Nc_max]

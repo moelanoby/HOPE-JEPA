@@ -107,7 +107,10 @@ def _per_example_loss(z, mask, predictor, slots):
             continue
         zc = z[i:i + 1, cpos, :]
         pred, w = predictor(zc, cpos.unsqueeze(0), tpos.unsqueeze(0), slots)
-        tgt = z[i:i + 1, tpos, :]
+        # Match the production code: JEPA targets are stop-gradient (standard
+        # JEPA practice + a major memory win). Keep the reference identical so
+        # the test stays a valid batching-equivalence check.
+        tgt = z[i:i + 1, tpos, :].detach()
         preds_list.append(pred)
         targets_list.append(tgt)
         weights_list.append(w)
