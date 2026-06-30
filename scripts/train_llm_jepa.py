@@ -71,6 +71,24 @@ class _NullCtx:
         return False
 
 
+def _oom_advice(args) -> str:
+    """Actionable text shown when a CUDA OOM fires during the training step."""
+    return (
+        "\n" + "!" * 72 + "\n"
+        "CUDA out of memory during the training step. The HOPE/Titans recurrence\n"
+        "is the memory sink -- it keeps per-token activations through backward.\n"
+        "Re-run with a smaller footprint, e.g. (in order of impact):\n"
+        f"  --max_len {max(128, args.max_len // 2)}          # halve sequence length (biggest lever)\n"
+        f"  --batch_size 1           # already 1? then only --max_len helps\n"
+        "  --target_layers last:1    # fewer HOPE-swapped layers\n"
+        "  --jepa_layers last:1      # fewer slot-JEPA heads (edit the config)\n"
+        "  --optimizer adalomo       # fuses update into backward (no grad state)\n"
+        "  --optimizer lisa --lisa_k 1   # freeze most base layers each step\n"
+        "The auto-fit already shrank batch_size/max_len on a <=16GB GPU; pass the\n"
+        "flags above explicitly to go smaller.\n" + "!" * 72
+    )
+
+
 def _split_lisa_params(model: HopeLLM):
     """Group the model's trainable params for LISA.
 
@@ -443,6 +461,33 @@ def main():
                          "Only used with --optimizer lisa.")
     args = ap.parse_args()
 
+    # --- Auto-fit memory knobs to the GPU (only if the user did NOT pass them). -
+    # A 3B + 152K-vocab model under QLoRA fits in ~16GB at batch_size=1, max_len
+    # 512; the script's hard defaults (batch_size=4, max_len=1024) were sized for
+    # a 24GB+ card and OOMs a T4/A10 on the first backward. We detect a small GPU
+    # and shrink the defaults, but only for args the user left at their default
+    # (an explicit flag always wins). Detected by comparing to the argparse
+    # default -- crude but reliable for these knobs.
+    DEFAULTS = {"batch_size": 4, "max_len": 1024, "prefetch": 4}
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        if vram_gb <= 17.0:                       # T4/P100 (16GB) and smaller
+            # The biggest single-GPU OOM levers: sequence length and batch size.
+            if args.max_len == DEFAULTS["max_len"]:
+                args.max_len = 512
+                print(f"[autofit] {vram_gb:.1f}GB GPU: --max_len 1024 -> 512 "
+                      f"(pass --max_len to override)", flush=True)
+            if args.batch_size == DEFAULTS["batch_size"]:
+                args.batch_size = 1
+                print(f"[autofit] {vram_gb:.1f}GB GPU: --batch_size 4 -> 1 "
+                      f"(pass --batch_size to override)", flush=True)
+            # Prefetch 4 batches of [B,T] CPU tensors is fine, but on a tiny card
+            # keep the CPU-side queue small.
+            if args.prefetch == DEFAULTS["prefetch"]:
+                args.prefetch = 2
+        # Also strongly recommend the paged 8-bit optimizer on small cards: it
+        # offloads optimizer state to CPU on OOM spikes instead of crashing.
+
     cfg = load_config(args.config)
 
     # --- Model ---
@@ -609,28 +654,39 @@ def main():
 
             set_global_step(model, step)
 
-            with amp_ctx:
-                out = model(input_ids=input_ids, attention_mask=attn_mask,
-                            labels=labels)
+            try:
+                with amp_ctx:
+                    out = model(input_ids=input_ids, attention_mask=attn_mask,
+                                labels=labels)
 
-            loss = out.loss / accum_steps
-            if fused_opt and isinstance(opt, AdaLomo):
-                # AdaLomo: single backward applies the fused update.
-                loss.backward()
-            elif fused_opt and isinstance(opt, LOMO):
-                # LOMO needs the GLOBAL grad norm, which is only known after
-                # backward -- but the update must happen DURING backward. So:
-                # (1) a DRY backward (retain_graph=True so the graph survives)
-                #     whose hooks only accumulate the global norm; then
-                # (2) zero grads, arm the live hooks, and a LIVE backward that
-                #     clips each grad by the measured norm and applies the SGD
-                #     step in place, freeing each grad as it goes.
-                opt.zero_grad()
-                loss.backward(retain_graph=True)   # dry: hooks only measure norm
-                opt.begin_fused_update()           # finalize norm, arm live hooks
-                loss.backward()                    # live: hooks apply + free grads
-            else:
-                loss.backward()
+                loss = out.loss / accum_steps
+                if fused_opt and isinstance(opt, AdaLomo):
+                    # AdaLomo: single backward applies the fused update.
+                    loss.backward()
+                elif fused_opt and isinstance(opt, LOMO):
+                    # LOMO needs the GLOBAL grad norm, which is only known after
+                    # backward -- but the update must happen DURING backward. So:
+                    # (1) a DRY backward (retain_graph=True so the graph survives)
+                    #     whose hooks only accumulate the global norm; then
+                    # (2) zero grads, arm the live hooks, and a LIVE backward that
+                    #     clips each grad by the measured norm and applies the SGD
+                    #     step in place, freeing each grad as it goes.
+                    opt.zero_grad()
+                    loss.backward(retain_graph=True)   # dry: hooks only measure norm
+                    opt.begin_fused_update()           # finalize norm, arm live hooks
+                    loss.backward()                    # live: hooks apply + free grads
+                else:
+                    loss.backward()
+            except torch.cuda.OutOfMemoryError:
+                # Clear whatever survived so the traceback/advice prints cleanly,
+                # then give actionable knobs instead of a bare stack trace.
+                try:
+                    opt.zero_grad(set_to_none=True)
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()
+                print(_oom_advice(args), flush=True)
+                raise SystemExit(1)
 
             batch_idx += 1
             if batch_idx % accum_steps == 0:
